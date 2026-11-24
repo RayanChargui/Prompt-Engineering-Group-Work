@@ -3,7 +3,7 @@
 Defence in depth:
   1. Capability tools only (no free-form shell) with strict argument schemas.
   2. Risk levels: read -> auto, write -> confirm (or auto in sandbox), danger -> always confirm.
-  3. Taint tracking: after untrusted text (documents, file contents) entered the
+  3. Taint tracking: after untrusted text (file contents) entered the
      model's context, even write actions need explicit confirmation.
   4. Untrusted text is wrapped, sanitised and scanned for injection phrases.
   5. The workspace jail itself is enforced in ops.py (not by the model).

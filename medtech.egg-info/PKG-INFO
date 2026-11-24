@@ -3,4 +3,5 @@ Name: medtech
 Version: 0.2
 Requires-Python: >=3.9
 Requires-Dist: rich
-Requires-Dist: pypdf
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"
