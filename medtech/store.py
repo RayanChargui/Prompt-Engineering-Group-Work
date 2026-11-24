@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions(
   id INTEGER PRIMARY KEY, mode TEXT NOT NULL, workspace TEXT, title TEXT, started_at REAL,
@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS messages(
 CREATE TABLE IF NOT EXISTS tasks(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   ts REAL, tool TEXT, args TEXT, risk TEXT, status TEXT, output TEXT);
+CREATE TABLE IF NOT EXISTS session_sequence(
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1), next_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS memories(
   id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL,
   created_at REAL NOT NULL, updated_at REAL NOT NULL);
@@ -85,6 +87,10 @@ class Store:
             # Remove the obsolete document index during upgrades; conversation tables stay intact.
             self.conn.execute("DROP TABLE IF EXISTS chunks")
             self.conn.execute("DROP TABLE IF EXISTS docs")
+            self.conn.execute("INSERT OR IGNORE INTO session_sequence(singleton,next_id) "
+                              "SELECT 1,COALESCE(MAX(id),0)+1 FROM sessions")
+            self.conn.execute("UPDATE session_sequence SET next_id=MAX(next_id,"
+                              "(SELECT COALESCE(MAX(id),0)+1 FROM sessions)) WHERE singleton=1")
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
@@ -112,8 +118,13 @@ class Store:
 
     def new_session(self, mode: str, workspace: str) -> int:
         now = time.time()
-        return self._w("INSERT INTO sessions(mode,workspace,started_at,created_at,updated_at) VALUES(?,?,?,?,?)",
-                       mode, workspace, now, now, now)
+        with self._transaction():
+            # Updating first obtains SQLite's writer lock before reading the reserved id.
+            self.conn.execute("UPDATE session_sequence SET next_id=next_id+1 WHERE singleton=1")
+            sid = self.conn.execute("SELECT next_id-1 FROM session_sequence WHERE singleton=1").fetchone()[0]
+            self.conn.execute("INSERT INTO sessions(id,mode,workspace,started_at,created_at,updated_at) "
+                              "VALUES(?,?,?,?,?,?)", (sid, mode, workspace, now, now, now))
+        return sid
 
     def session(self, sid: int) -> Optional[sqlite3.Row]:
         rows = self._q("SELECT * FROM sessions WHERE id=?", sid)

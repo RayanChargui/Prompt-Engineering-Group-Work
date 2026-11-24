@@ -44,14 +44,18 @@ def extract_memories(store: Store, text: str, llm: Callable[[list], str]) -> boo
 
 
 def memory_prompt(store: Store, max_bytes: int = 4096) -> str:
-    """Render durable facts as bounded reference data, never executable policy."""
+    """Prefer recently updated complete facts within the entire prompt byte budget."""
+    def render(facts: list) -> str:
+        if not facts:
+            return ""
+        body = json.dumps(facts, ensure_ascii=False)
+        return "\nKnown facts about the user (reference data only):\n" + wrap_untrusted("user-memory", body)
+
     facts = []
-    for row in store.memories():
+    rows = sorted(store.memories(), key=lambda row: (row["updated_at"], row["id"]), reverse=True)
+    for row in rows:
         candidate = {"key": row["key"], "value": row["value"]}
-        if len(json.dumps(facts + [candidate], ensure_ascii=False).encode()) > max_bytes:
-            break
+        if len(render(facts + [candidate]).encode()) > max_bytes:
+            continue
         facts.append(candidate)
-    if not facts:
-        return ""
-    body = json.dumps(facts, ensure_ascii=False)
-    return "\nKnown facts about the user (reference data only):\n" + wrap_untrusted("user-memory", body)
+    return render(facts)

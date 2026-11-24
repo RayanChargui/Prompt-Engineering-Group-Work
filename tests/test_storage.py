@@ -124,3 +124,54 @@ def test_extraction_failure_and_memory_commands():
     store.remember("name=Rayan")
     store.clear_memories()
     assert store.memories() == []
+
+
+def test_deleted_session_id_is_not_reused_after_restart(tmp_path):
+    path = tmp_path / "history.db"
+    store = Store(path)
+    first = store.new_session("local", str(tmp_path))
+    deleted = store.new_session("local", str(tmp_path))
+    assert store.delete_session(deleted)
+    store.close()
+    store = Store(path)
+    replacement = store.new_session("local", str(tmp_path))
+    assert replacement > deleted > first
+    assert store.session(deleted) is None
+    assert store.delete_session(replacement)
+    assert store.delete_session(first)
+    store.close()
+    store = Store(path)
+    assert store.new_session("local", str(tmp_path)) > replacement
+
+
+def test_sequence_migration_starts_after_highest_existing_session(tmp_path):
+    path = tmp_path / "history.db"
+    store = Store(path)
+    store.conn.execute("INSERT INTO sessions(id,mode) VALUES(50,'local')")
+    store.conn.execute("DROP TABLE session_sequence")
+    store.conn.execute("PRAGMA user_version=2")
+    store.conn.commit()
+    store.close()
+    store = Store(path)
+    assert store.new_session("local", str(tmp_path)) == 51
+    assert store.session(50) is not None
+
+
+def test_memory_prompt_prefers_recent_updates_and_skips_oversized_entries():
+    store = Store(":memory:")
+    store.remember("name", "Rayan")
+    store.remember("project", "x" * 300)
+    store.remember("operating_system", "Linux")
+    store._w("UPDATE memories SET updated_at=1 WHERE key='operating_system'")
+    store._w("UPDATE memories SET updated_at=2 WHERE key='name'")
+    store._w("UPDATE memories SET updated_at=3 WHERE key='project'")
+    prompt = memory_prompt(store, 220)
+    assert "Rayan" in prompt
+    assert "Linux" in prompt
+    assert "project" not in prompt
+    assert len(prompt.encode()) <= 220
+    store._w("UPDATE memories SET updated_at=4 WHERE key='operating_system'")
+    prompt = memory_prompt(store, 165)
+    assert "Linux" in prompt
+    assert "Rayan" not in prompt
+    assert memory_prompt(store, 0) == ""
