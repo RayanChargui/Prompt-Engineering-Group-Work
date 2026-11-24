@@ -6,10 +6,12 @@ so both modes share exactly the same code and the same jail rules.
 import datetime
 import fnmatch
 import getpass
+import hashlib
 import os
 import platform
 import shutil
 import subprocess
+import time
 
 MAX_READ, MAX_WRITE, MAX_LIST, MAX_HITS = 20_000, 100_000, 200, 50
 BLOCKED_FILES = {".env", "id_rsa", "id_ed25519", ".netrc", ".pgpass"}
@@ -23,6 +25,9 @@ class Denied(Exception):
 class Ctx:
     def __init__(self, root, cwd):
         self.root, self.cwd = root, cwd
+        self.verified = []
+        self.stderr = ""
+        self.exit_code = 0
 
 
 def resolve(c, path):
@@ -52,15 +57,14 @@ def rel(c, p):
 
 
 def _pwd(c, a):
-    r = rel(c, c.cwd)
-    return ("workspace" if r == "." else f"workspace/{r}"), None
+    return c.cwd, None
 
 
 def _cd(c, a):
     p = resolve(c, a["path"])
     if not os.path.isdir(p):
         raise Denied("not a directory")
-    return f"now in {rel(c, p)}", p
+    return f"now in {p}", p
 
 
 def _ls(c, a):
@@ -96,15 +100,25 @@ def _write(c, a):
     if mode == "create" and os.path.exists(p):
         raise Denied("file exists (use mode 'overwrite' or 'append')")
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "a" if mode == "append" else "w", encoding="utf-8", newline="") as f:
+    if mode not in {"create", "overwrite", "append"}:
+        raise Denied("invalid write mode")
+    before = os.path.getsize(p) if mode == "append" and os.path.exists(p) else 0
+    with open(p, {"create": "x", "append": "a", "overwrite": "w"}[mode], encoding="utf-8", newline="") as f:
         f.write(content)
-    return f"wrote {len(content)} chars to {rel(c, p)} ({mode})", None
+    data = content.encode("utf-8")
+    with open(p, "rb") as f:
+        f.seek(before)
+        if f.read() != data:
+            raise OSError("write read-back verification failed")
+    verify(c, p)
+    return f"verified write of {len(content)} chars to {p} ({mode})", None
 
 
 def _mkdir(c, a):
     p = resolve(c, a["path"])
     os.makedirs(p, exist_ok=True)
-    return f"created {rel(c, p)}/", None
+    verify(c, p)
+    return f"verified directory {p}", None
 
 
 def _dest(c, src, dst_arg):
@@ -125,7 +139,10 @@ def _move(c, a):
         raise Denied("source not found")
     dst = _dest(c, src, a["dst"])
     shutil.move(src, dst)
-    return f"moved {rel(c, src)} -> {rel(c, dst)}", None
+    if os.path.lexists(src):
+        raise OSError("move verification failed: source still exists")
+    verify(c, dst)
+    return f"verified move {src} -> {dst}", None
 
 
 def _copy(c, a):
@@ -134,7 +151,8 @@ def _copy(c, a):
         raise Denied("source not found")
     dst = _dest(c, src, a["dst"])
     (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dst)
-    return f"copied {rel(c, src)} -> {rel(c, dst)}", None
+    verify(c, dst)
+    return f"verified copy {src} -> {dst}", None
 
 
 def _delete(c, a):
@@ -147,7 +165,9 @@ def _delete(c, a):
         os.remove(p)
     else:
         raise Denied("not found")
-    return f"deleted {rel(c, p)}", None
+    if os.path.lexists(p):
+        raise OSError("delete verification failed: path still exists")
+    return f"deleted {p}", None
 
 
 def _search(c, a):
@@ -161,7 +181,7 @@ def _search(c, a):
                 continue
             if kind == "name":
                 if q in f.lower() or fnmatch.fnmatch(f.lower(), q):
-                    hits.append(rel(c, fp))
+                    hits.append(fp)
             else:
                 try:
                     if os.path.getsize(fp) > 1_000_000:
@@ -169,7 +189,7 @@ def _search(c, a):
                     with open(fp, "r", encoding="utf-8") as fh:
                         for n, line in enumerate(fh, 1):
                             if q in line.lower():
-                                hits.append(f"{rel(c, fp)}:{n}: {line.strip()[:120]}")
+                                hits.append(f"{fp}:{n}: {line.strip()[:120]}")
                                 break
                 except (UnicodeDecodeError, OSError):
                     continue
@@ -186,10 +206,11 @@ def _sysinfo(c, a):
         for cmd in cmds:
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                return (r.stdout or r.stderr)[:4000], None
+                c.exit_code, c.stderr = r.returncode, r.stderr
+                return r.stdout, None
             except FileNotFoundError:
                 continue
-        return "no network tool found", None
+        raise FileNotFoundError("no network tool found")
     if k == "os":
         return f"{sysname} {platform.release()} ({platform.machine()}), Python {platform.python_version()}", None
     if k == "whoami":
@@ -207,8 +228,20 @@ TOOLS = {"pwd": _pwd, "cd": _cd, "ls": _ls, "read_file": _read, "write_file": _w
          "search": _search, "sysinfo": _sysinfo}
 
 
-def run(req):
-    """req: {root, cwd, tool, args} -> {ok, output, cwd}"""
+def verify(c: Ctx, path: str) -> None:
+    """Record a stat/read-back result in the environment that performed the write."""
+    st = os.stat(path)
+    record = {"path": path, "kind": "directory" if os.path.isdir(path) else "file",
+              "exists": True, "size": st.st_size}
+    if os.path.isfile(path) and st.st_size <= MAX_WRITE:
+        with open(path, "rb") as f:
+            record["sha256"] = hashlib.sha256(f.read()).hexdigest()
+    c.verified.append(record)
+
+
+def run(req: dict) -> dict:
+    """Execute one jailed operation and preserve success, diagnostics, and evidence."""
+    started = time.monotonic()
     root = os.path.realpath(req["root"])
     cwd = os.path.realpath(req.get("cwd") or root)
     try:
@@ -217,10 +250,15 @@ def run(req):
     except ValueError:
         cwd = root
     c = Ctx(root, cwd)
+    out, err, code = "", "", 0
     try:
         out, new = TOOLS[req["tool"]](c, req.get("args") or {})
-        return {"ok": True, "output": out, "cwd": new or cwd}
+        cwd = new or cwd
+        code, err = c.exit_code, c.stderr
     except Denied as e:
-        return {"ok": False, "output": f"DENIED: {e}", "cwd": cwd}
-    except Exception as e:  # noqa: BLE001 - report any tool failure to the model
-        return {"ok": False, "output": f"ERROR: {type(e).__name__}: {e}", "cwd": cwd}
+        code, err = 1, f"DENIED: {e}"
+    except Exception as e:  # report failures to both the UI and model
+        code, err = 1, f"ERROR: {type(e).__name__}: {e}"
+    return {"success": code == 0, "exit_code": code, "stdout": out, "stderr": err,
+            "cwd": cwd, "duration": time.monotonic() - started,
+            "verified": c.verified if code == 0 else []}
