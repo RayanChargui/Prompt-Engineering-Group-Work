@@ -1,0 +1,2 @@
+[console_scripts]
+medtech = medtech.cli:main
