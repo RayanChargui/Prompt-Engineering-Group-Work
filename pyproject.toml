@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "medtech"
 version = "0.2"
 requires-python = ">=3.9"
-dependencies = ["rich"]
+dependencies = ["rich", "textual>=0.89,<2"]
 
 [project.scripts]
 medtech = "medtech.cli:main"
@@ -15,8 +15,10 @@ medtech = "medtech.cli:main"
 packages = ["medtech"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-asyncio>=0.23,<1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = ["docker: requires a reachable Docker daemon and sandbox image"]

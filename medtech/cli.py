@@ -2,6 +2,7 @@
 import argparse
 import json
 import shlex
+import sys
 from datetime import datetime
 
 from rich import box
@@ -26,6 +27,7 @@ HELP = f"""[bold {ACCENT}]/new[/] new chat    [bold {ACCENT}]/history[/] or [bol
 [bold {ACCENT}]/memory[/] list facts    [bold {ACCENT}]/remember <fact>[/] save fact
 [bold {ACCENT}]/forget <id or text>[/] remove fact    [bold {ACCENT}]/memory clear[/] remove all facts
 [bold {ACCENT}]/auto on|off[/] auto-approve safe writes (deletes and overwrites always ask)
+[bold {ACCENT}]/debug on|off[/] log tool diagnostics to file
 [bold {ACCENT}]/tasks [id|all][/] executed actions    [bold {ACCENT}]/help[/] help    [bold {ACCENT}]exit[/] leave"""
 
 # ---------- big title ----------
@@ -185,11 +187,13 @@ def build_parser():
     p = argparse.ArgumentParser(prog="medtech", description="MedTech terminal agent")
     p.add_argument("--mode", choices=["sandbox", "local"], help="skip the question")
     p.add_argument("--workspace", default="~/medtech-workspace", help="folder the agent may touch in local mode")
-    p.add_argument("--model", help="Ollama chat model")
+    p.add_argument("--model", help="Ollama chat model (default qwen2.5:7b or MEDTECH_MODEL)")
+    p.add_argument("--num-ctx", type=int, help="model context size, 8192..32768 (MEDTECH_NUM_CTX or 16384)")
+    p.add_argument("--plain", action="store_true", help="use the line-oriented interface instead of the Textual UI")
     resume = p.add_mutually_exclusive_group()
     resume.add_argument("--resume", type=int, nargs="?", const=-1, metavar="ID", help="resume ID, or latest chat if omitted")
     resume.add_argument("--continue", dest="continue_latest", action="store_true", help="resume latest chat")
-    p.add_argument("--debug", action="store_true", help="log tool arguments and raw results to stderr")
+    p.add_argument("--debug", action="store_true", help="log tool arguments and raw results to MEDTECH_HOME/debug.log")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("sessions", help="list all sessions")
     h = sub.add_parser("history", help="show a session's chat")
@@ -303,6 +307,10 @@ def command(line: str, agent: Agent, store: Store) -> None:
             c.print(f"[dim]Forgot {count} fact(s)[/]")
         elif cmd == "/tasks":
             show_tasks(store, None if arg == "all" else int(arg) if arg else agent.sid)
+        elif cmd == "/debug" and arg in ("", "on", "off"):
+            if arg:
+                agent.debug = arg == "on"
+            c.print(f"debug logging: {'on' if agent.debug else 'off'} (MEDTECH_HOME/debug.log)")
         elif cmd == "/auto" and arg in ("on", "off"):
             agent.auto = arg == "on"
             c.print(f"auto-approve safe writes: {'on' if agent.auto else 'off'}")
@@ -327,11 +335,15 @@ def _main(argv=None):
             return show_history(store, a.id) if a.id is not None else show_sessions(store)
         if a.cmd == "tasks":
             return show_tasks(store, None if a.id == "all" else int(a.id))
-        if c.is_terminal:
+        use_tui = not a.plain and sys.stdin.isatty() and sys.stdout.isatty()
+        if c.is_terminal and not use_tui:
             draw_logo()
         cfg = Config()
         if a.model:
             cfg.model = a.model
+        if a.num_ctx is not None:
+            cfg.num_ctx = a.num_ctx
+            cfg.__post_init__()
         resumed = None
         if a.resume is not None or a.continue_latest:
             resumed = store.latest_session() if a.resume in (None, -1) else store.session(a.resume)
@@ -342,6 +354,10 @@ def _main(argv=None):
             return c.print("[dim]Goodbye.[/]")
         workspace = resumed["workspace"] if resumed else a.workspace if mode == "local" else None
         backend = make_backend(mode, workspace)
+        if use_tui:
+            from .tui import MedTechApp
+            return MedTechApp(cfg, backend, store, sid=resumed["id"] if resumed else None,
+                              auto=(mode == "sandbox"), debug=a.debug).run()
         sid = resumed["id"] if resumed else store.new_session(mode, getattr(backend, "host_root", backend.root))
         agent = Agent(cfg, backend, store, sid, UI(), auto=(mode == "sandbox"), debug=a.debug)
         show_banner(cfg, mode, backend, sid, agent)
