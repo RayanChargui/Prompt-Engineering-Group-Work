@@ -36,6 +36,7 @@ def test_copy_move_verification(tmp_path):
     assert copied["success"] and copied["verified"][0]["path"] == str(tmp_path / "b")
     moved = backend.run("move", {"src": "b", "dst": "c"})
     assert moved["success"] and moved["verified"][0]["path"] == str(tmp_path / "c")
+    assert {"path": str(tmp_path / "b"), "kind": "file", "exists": False} in moved["verified"]
     assert not (tmp_path / "b").exists()
     assert (tmp_path / "c").read_text() == "hi"
 
@@ -193,3 +194,66 @@ def test_real_docker_creation_persistence_and_host_mapping(tmp_path):
         assert fresh.run("read_file", {"path": "test_dir/hello.txt"})["stdout"] == "hi"
     finally:
         backend._docker("rm", "-f", backend.box)
+
+
+@pytest.mark.docker
+@pytest.mark.skipif(not docker_available(), reason="Docker daemon unavailable")
+def test_real_docker_agent_scripted_llm_acceptance(tmp_path):
+    """Exercise the actual agent loop, Docker transport, disk audit, and host mount."""
+    from medtech.agent import Agent, Config
+    from medtech.store import Store
+
+    class UI:
+        def __init__(self): self.answers = []
+        def say(self, text): self.answers.append(text)
+        def warn(self, text): self.answers.append(text)
+        def action(self, *args): pass
+        def confirm(self, *args): return True
+        def result(self, *args): pass
+
+    def response(say="", tool=None, **args):
+        return json.dumps({"say": say, "action": {"tool": tool, "args": args} if tool else None})
+
+    steps = iter([response(tool="mkdir", path="test_dir"),
+                  response(tool="write_file", path="test_dir/hello.txt", content="hi"),
+                  response("Created directory /workspace/test_dir and file /workspace/test_dir/hello.txt.")])
+    contexts = []
+
+    def llm(messages):
+        if messages[0]["content"].startswith("Extract only"):
+            return '{"facts":[]}'
+        contexts.append(messages)
+        return next(steps)
+
+    backend = SandboxBackend(str(tmp_path / "host-files"), name="medtech-agent-test-" + uuid.uuid4().hex[:12])
+    store = Store(str(tmp_path / "agent.db"))
+    try:
+        backend.ensure()
+        sid = store.new_session("sandbox", backend.host_root)
+        ui = UI()
+        agent = Agent(Config(), backend, store, sid, ui, auto=True, llm=llm)
+        agent.turn("Create folder test_dir with hello.txt containing hi")
+        assert (Path(backend.host_root) / "test_dir/hello.txt").read_text() == "hi"
+        readback = backend.run("read_file", {"path": "/workspace/test_dir/hello.txt"})
+        assert readback["success"] and readback["stdout"] == "hi"
+        tasks = store.tasks(sid)
+        assert [task["status"] for task in tasks] == ["done", "done"]
+        results = [json.loads(task["output"]) for task in tasks]
+        assert [result["verified"][0]["path"] for result in results] == [
+            "/workspace/test_dir", "/workspace/test_dir/hello.txt"]
+        assert len(contexts) == 3
+        assert any('"success": true' in message["content"] for message in contexts[-1])
+        assert ui.answers == ["Created directory /workspace/test_dir and file /workspace/test_dir/hello.txt."]
+    finally:
+        store.close()
+        backend._docker("rm", "-f", backend.box)
+
+
+def test_delete_records_verified_absence(tmp_path):
+    backend = LocalBackend(str(tmp_path))
+    backend.run("mkdir", {"path": "test_dir"})
+    backend.run("write_file", {"path": "test_dir/hello.txt", "content": "hi"})
+    result = backend.run("delete", {"path": "test_dir", "recursive": True})
+    assert result["success"]
+    assert result["verified"] == [{"path": str(tmp_path / "test_dir"), "kind": "directory", "exists": False}]
+    assert not (tmp_path / "test_dir").exists()
