@@ -49,6 +49,9 @@ def require(condition: bool, message: str) -> None:
 
 def worker(action: str, root: Path) -> None:
     """Use separate processes to demonstrate SQLite persistence across restarts."""
+    if action in ("resume", "new"):
+        require(root is not None and (root / "session-id").is_file(),
+                "Prerequisite failed: the initial name-memory check did not save a session.")
     store = Store()
     backend = LocalBackend(str(root / "local"))
     ui = CaptureUI()
@@ -99,6 +102,9 @@ def real_creation(backend: object, db: Path) -> None:
         require(result["success"] and result["stdout"] == "hi", f"Environment read-back failed: {result}")
         host_file = Path(backend.host_root) / "test_dir" / "hello.txt"
         require(host_file.read_text(encoding="utf-8") == "hi", f"Host file missing or incorrect: {host_file}")
+        verified_path = backend.root + "/test_dir/hello.txt"
+        require(bool(ui.answers) and verified_path in ui.answers[-1],
+                "The agent did not give an accepted final completion containing the verified absolute file path")
         require(any(task["status"] == "done" and task["tool"] == "write_file" for task in store.tasks(sid)),
                 "No successful write_file audit record")
     finally:
@@ -165,7 +171,12 @@ def main() -> int:
     parser.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker:
-        worker(args.worker, args.root)
+        try:
+            require(args.root is not None, "Worker requires --root.")
+            worker(args.worker, args.root)
+        except Exception as exc:
+            print(f"{args.worker} check failed: {exc}", file=sys.stderr, flush=True)
+            return 1
         return 0
     failures = []
 
