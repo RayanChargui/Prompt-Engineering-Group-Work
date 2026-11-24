@@ -35,7 +35,8 @@ class CaptureUI:
         pass
 
     def confirm(self, *args: object) -> bool:
-        return True
+        # Automated real-model checks never authorize destructive proposals.
+        return bool(args) and getattr(args[-1], "risk", "danger") != "danger"
 
     def result(self, ok: bool, text: str) -> None:
         if not ok:
@@ -54,7 +55,7 @@ def worker(action: str, root: Path) -> None:
         require(root is not None and (root / "session-id").is_file(),
                 "Prerequisite failed: the initial name-memory check did not save a session.")
     store = Store()
-    backend = LocalBackend(str(root / "local"))
+    backend = LocalBackend(str(root / "local"), permissions_mode="workspace")
     ui = CaptureUI()
     try:
         if action == "remember":
@@ -142,6 +143,68 @@ def ui_check(root: Path) -> None:
     asyncio.run(exercise())
 
 
+def full_access_check(root: Path) -> None:
+    """Verify a real full-access write under home, outside the checkout, then clean up."""
+    backend = LocalBackend(str(root / "full-access-cwd"), permissions_mode="full")
+    with tempfile.TemporaryDirectory(prefix="medtech-full-access-", dir=Path.home()) as directory:
+        target = Path(directory) / "verified.txt"
+        created = backend.run("write_file", {"path": str(target), "content": "hi"})
+        require(created["success"], f"Home-directory write failed: {created['stderr']}")
+        require(created["verified"] and created["verified"][0]["path"] == str(target.resolve()),
+                "Full-access write did not verify the actual absolute path")
+        read = backend.run("read_file", {"path": str(target)})
+        require(read["success"] and read["stdout"] == "hi", "Full-access read-back failed")
+        removed = backend.run("delete", {"path": str(target)})
+        require(removed["success"] and not target.exists(), "Full-access temporary file deletion failed")
+
+
+def concise_check(root: Path) -> None:
+    """Check a real mounted concise UI with a scripted model and actual temporary file."""
+    from textual.widgets import Static
+    from medtech.tui import MedTechApp
+
+    async def exercise() -> None:
+        store = Store(str(root / "concise.db"))
+        backend = LocalBackend(str(root / "concise-cwd"), permissions_mode="full")
+        target = Path(backend.root) / "result.txt"
+        full_answer = f"Let me explain the result. Created file {target}. Let me know if you need anything else."
+        responses = iter([
+            json.dumps({"say": "Let me create that file for you.",
+                        "action": {"tool": "write_file", "args": {"path": str(target), "content": "hi"}}}),
+            json.dumps({"say": full_answer, "action": None}),
+        ])
+
+        def fake_model(messages: list) -> str:
+            if messages[0]["content"].startswith("Extract only"):
+                return '{"facts":[]}'
+            return next(responses)
+
+        cfg = Config()
+        cfg.ui.details = False
+        cfg.ui.ascii = False
+        try:
+            app = MedTechApp(cfg, backend, store, llm=fake_model)
+            async with app.run_test(size=(120, 36)) as pilot:
+                await app.send_message("Create result.txt containing hi.")
+                deadline = asyncio.get_running_loop().time() + 10
+                while app.busy:
+                    require(asyncio.get_running_loop().time() < deadline, "Concise UI turn did not finish")
+                    await pilot.pause(0.03)
+                rendered = "\n".join(getattr(widget.renderable, "plain", str(widget.renderable))
+                                     for widget in app.query("#transcript Static"))
+                require(str(target) in rendered, "Concise outcome is missing the verified absolute path")
+                require("Let me" not in rendered and "let me" not in rendered.lower(),
+                        "Concise UI leaked model narration or an offer")
+                require(not app.query("#transcript Collapsible"), "Concise UI exposed tool chatter")
+                require(target.read_text(encoding="utf-8") == "hi", "Concise check did not create the real file")
+                require(any(full_answer in row["content"] for row in store.messages(app.sid)),
+                        "UI post-processing changed or discarded the full stored assistant answer")
+        finally:
+            store.close()
+
+    asyncio.run(exercise())
+
+
 def cli_checks(root: Path) -> None:
     """Exercise public chat and memory commands against a separate real database."""
     from medtech.cli import command
@@ -182,7 +245,7 @@ def safety_checks(root: Path) -> None:
     else:
         raise RuntimeError("Partial tool call was accepted")
     require(unsupported_claim("I created the folder", []), "Unsupported creation claim was accepted")
-    backend = LocalBackend(str(root / "failure"))
+    backend = LocalBackend(str(root / "failure"), permissions_mode="workspace")
     result = backend.run("write_file", {"path": "/etc/medtech-forbidden-check", "content": "hi"})
     require(not result["success"] and result["exit_code"] != 0 and bool(result["stderr"]),
             "A rejected write was reported as success")
@@ -210,8 +273,11 @@ def main() -> int:
             return 1
         return 0
     failures = []
+    checks_run = 0
 
     def check(name: str, function: object) -> None:
+        nonlocal checks_run
+        checks_run += 1
         try:
             function()
         except Exception as exc:
@@ -229,6 +295,8 @@ def main() -> int:
             cfg = Config()
             print(f"Using real Ollama at {cfg.url}, model {cfg.model}; temporary data at {root}", flush=True)
             check("headless Textual UI launch and new-chat action", lambda: ui_check(root))
+            check("full local access writes outside the project in a temporary home directory", lambda: full_access_check(root))
+            check("concise UI shows verified outcomes and preserves full database history", lambda: concise_check(root))
             check("Ollama responds with valid agent JSON", lambda: parse(chat(cfg, [
                 {"role": "user", "content": 'Reply exactly {"say":"ready","action":null}'}])))
             check("session saved and durable user fact extracted", lambda: run_worker("remember", root))
@@ -237,7 +305,7 @@ def main() -> int:
             check("chat and memory CLI commands", lambda: cli_checks(root))
             check("malformed calls, unsupported claims, failures, and corrupted DB", lambda: safety_checks(root))
             check("real model creates local folder and file", lambda: real_creation(
-                LocalBackend(str(root / "local-creation")), root / "local-creation.db"))
+                LocalBackend(str(root / "local-creation"), permissions_mode="workspace"), root / "local-creation.db"))
 
             def docker_check() -> None:
                 sandbox.ensure()
@@ -261,7 +329,7 @@ def main() -> int:
                 os.environ.pop("MEDTECH_HOME", None)
             else:
                 os.environ["MEDTECH_HOME"] = previous
-    print(f"{9 - len(failures)} passed; {len(failures)} failed. No required checks are skipped.")
+    print(f"{checks_run - len(failures)} passed; {len(failures)} failed. No required checks are skipped.")
     return 1 if failures else 0
 
 

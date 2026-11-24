@@ -42,7 +42,7 @@ def test_copy_move_verification(tmp_path):
 
 
 def test_local_failures_not_success(tmp_path, monkeypatch):
-    backend = LocalBackend(str(tmp_path))
+    backend = LocalBackend(str(tmp_path), permissions_mode="workspace")
     for path in ("../../etc/passwd", "/etc/passwd", ".env"):
         result = backend.run("write_file", {"path": path, "content": "no"})
         assert not result["success"] and result["exit_code"] != 0
@@ -198,10 +198,11 @@ def test_real_docker_creation_persistence_and_host_mapping(tmp_path):
 
 @pytest.mark.docker
 @pytest.mark.skipif(not docker_available(), reason="Docker daemon unavailable")
-def test_real_docker_agent_scripted_llm_acceptance(tmp_path):
+def test_real_docker_agent_scripted_llm_acceptance(tmp_path, monkeypatch):
     """Exercise the actual agent loop, Docker transport, disk audit, and host mount."""
     from medtech.agent import Agent, Config
     from medtech.store import Store
+    monkeypatch.setenv("MEDTECH_HOME", str(tmp_path / "state"))
 
     class UI:
         def __init__(self): self.answers = []

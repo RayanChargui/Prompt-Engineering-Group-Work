@@ -44,7 +44,7 @@ def reply(say="", tool=None, **args):
 
 def make_agent(tmp_path, responses, **kwargs):
     store = Store(str(tmp_path / "chat.db"))
-    backend = LocalBackend(str(tmp_path / "files"))
+    backend = LocalBackend(str(tmp_path / "files"), permissions_mode="workspace")
     sid = store.new_session("local", backend.root)
     ui = UI(kwargs.pop("confirm", True))
     llm = ScriptedLLM(responses, kwargs.pop("facts", '{"facts":[]}'))
@@ -121,7 +121,8 @@ def test_failure_cannot_become_success(tmp_path, capsys, monkeypatch):
     assert '"success": false' in debug and '"path": "/etc/no"' in debug
 
 
-def test_denied_action_stops_without_claim(tmp_path):
+def test_denied_action_stops_without_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(policy, "check", lambda *args, **kwargs: policy.Decision("confirm", "danger", "Simulated catastrophic action"))
     agent = make_agent(tmp_path, [reply("", "delete", path="x")], confirm=False)
     agent.turn("delete x")
     assert agent.store.tasks(agent.sid)[0]["status"] == "denied"
@@ -263,3 +264,28 @@ def test_resolved_delete_invalidates_symlink_path_evidence(tmp_path):
     agent.turn("Create then delete file real/file.txt")
     assert not any(e == ("say", "Created file real/file.txt") for e in agent.ui.log)
     assert agent.ui.log[-1] == ("say", "Deleted file real/file.txt")
+
+
+@pytest.mark.parametrize('path,cwd,claim', [
+    ('C:\\Users\\nalla\\Desktop\\test', 'C:\\Users\\nalla\\medtech-workspace', 'Created directory C:\\Users\\nalla\\Desktop\\test'),
+    ('/tmp/John Smith/test', '/tmp', 'Created directory /tmp/John Smith/test.'),
+    ('/tmp/other/test', '/tmp/start', 'Created directory ../other/test.'),
+])
+def test_guard_accepts_verified_arbitrary_native_paths(path, cwd, claim):
+    evidence = [('mkdir', {'cwd': cwd, 'verified': [{'path': path, 'exists': True, 'kind': 'directory'}]})]
+    assert not unsupported_claim(claim, evidence)
+    assert unsupported_claim('Created directory imaginary', evidence)
+
+
+def test_guard_expands_home_alias_without_accepting_unverified_names(tmp_path, monkeypatch):
+    monkeypatch.setenv('HOME', str(tmp_path))
+    evidence = [('mkdir', {'cwd': '/elsewhere', 'verified': [{'path': str(tmp_path / 'test'), 'exists': True, 'kind': 'directory'}]})]
+    assert not unsupported_claim('Created directory ~/test.', evidence)
+    assert unsupported_claim('Created directory ~/imaginary.', evidence)
+
+
+def test_guard_matches_absolute_file_and_directory_in_one_result_sentence():
+    evidence = [('mkdir', {'cwd': '/workspace', 'verified': [{'path': '/workspace/test_dir', 'exists': True, 'kind': 'directory'}]}),
+                ('write_file', {'cwd': '/workspace', 'verified': [{'path': '/workspace/test_dir/hello.txt', 'exists': True, 'kind': 'file'}]})]
+    assert not unsupported_claim('Created directory /workspace/test_dir and file /workspace/test_dir/hello.txt.', evidence)
+    assert unsupported_claim('Created file /workspace/test_dir/imaginary.txt.', evidence)

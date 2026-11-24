@@ -1,7 +1,7 @@
 # MedTech — local terminal AI assistant
 
 MedTech is a Python terminal assistant powered by a model running through
-[Ollama](https://ollama.com/). You can chat, manage files inside a chosen workspace,
+[Ollama](https://ollama.com/). You can chat, manage files anywhere your OS account can access,
 keep conversations across restarts, and save facts the assistant can use in new chats.
 File operations run either on your computer or in a persistent Docker sandbox.
 
@@ -20,6 +20,8 @@ offline. The model generates responses; MedTech controls which tools actually ru
 - [Conversations and memory](#conversations-and-memory)
 - [Local mode, Docker mode, and paths](#local-mode-docker-mode-and-paths)
 - [Permissions and execution results](#permissions-and-execution-results)
+- [Concise output and Details](#concise-output-and-details)
+- [Themes and terminal appearance](#themes-and-terminal-appearance)
 - [Configuration](#configuration)
 - [Data, privacy, backup, and updates](#data-privacy-backup-and-updates)
 - [Troubleshooting](#troubleshooting)
@@ -38,7 +40,7 @@ Ask in ordinary language; you do not need to write JSON or memorize tool names.
 | List files and navigate | `List this workspace, then change into test_dir.` |
 | Search filenames or text | `Find files whose names contain notes.` |
 | Move and copy files or directories | `Copy notes.txt to notes-backup.txt.` |
-| Delete files or directories, with confirmation | `Delete notes-backup.txt.` |
+| Delete files or directories | `Delete notes-backup.txt.` |
 | Inspect the execution environment | `Show the OS version and free disk space.` |
 | Remember user facts | `My name is Rayan. I prefer explanations in French.` |
 | Return to earlier conversations | Use `/history` and `/resume ID`. |
@@ -50,8 +52,8 @@ saving code does not execute it. For live filesystem questions, ask it to inspec
 the workspace rather than guess. General knowledge comes from the installed model
 and may be incomplete or outdated.
 
-Only files inside the active workspace are accessible through its file tools.
-System information describes the environment executing the tool: in sandbox mode,
+Local mode defaults to full filesystem access, with an optional restricted
+`workspace` mode. Docker keeps its isolated bind-mount boundaries. System information describes the environment executing the tool: in sandbox mode,
 that is the container, not necessarily your host computer.
 
 ## Requirements
@@ -168,8 +170,10 @@ medtech --mode local --model YOUR_INSTALLED_TAG --workspace ~/medtech-workspace
 not on your PATH. On PowerShell, an explicit workspace can be written as
 `--workspace "$HOME\medtech-workspace"`.
 
-A missing workspace directory is created automatically. This is where file tools
-work; it is independent of the repository containing the application source.
+A missing starting directory is created automatically. `--workspace` selects the
+initial local current directory; in the default `full` permission mode it does not
+limit access to that directory. It is independent of the repository containing
+the application source. The current directory appears in the status bar.
 
 For sandbox mode, start Docker first, then run:
 
@@ -214,9 +218,10 @@ The sidebar groups chats under Today, Yesterday, Previous 7 days, and Older,
 with the current chat highlighted. Click a chat or focus the list and use arrow
 keys plus Enter to resume it; search to find older
 conversations. The Memory view lists durable facts separately from chat history.
-Model output appears as a provisional streaming draft; a final answer becomes
-accepted only after parsing and execution-evidence checks. Rejected drafts or
-action proposals are discarded rather than presented as completed work.
+By default, the transcript shows concise outcomes instead of planning text and
+tool chatter. The animated status indicator shows progress. Turn on **Details**
+to inspect streaming drafts, calls, results, retries, and verification evidence;
+a final answer is still accepted only after execution-evidence checks.
 
 | Key / action | Behavior |
 | --- | --- |
@@ -225,6 +230,8 @@ action proposals are discarded rather than presented as completed work.
 | **Ctrl+N** | New conversation |
 | **Ctrl+B** | Show or hide the conversation sidebar |
 | **Ctrl+F** | Focus chat search |
+| **Ctrl+D** | Toggle Details, including earlier messages in the current chat |
+| **Ctrl+T** | Open the theme and ASCII-glyph selector |
 | **F2** | Rename the selected conversation |
 | **Delete** | With the chat list focused, delete the selected conversation after confirmation |
 | **Ctrl+O** or right-click a chat | Open its context menu |
@@ -246,10 +253,11 @@ Read test_dir/hello.txt and list the folder.
 exit
 ```
 
-Replace `1` with the actual session ID shown by your app. Local file creation asks
-for permission; review the proposed tool and arguments in the confirmation
-dialog and allow or deny it. Denying an action stops the current turn. The plain
-compatibility interface uses a `y`/`n` prompt with refusal as the default.
+Replace `1` with the actual session ID shown by your app. Ordinary local file
+operations run without approval prompts. Clearly catastrophic supported operations,
+such as recursively deleting your home directory, require confirmation by default.
+Denying one stops the operation. In Docker, the existing sandbox approval rules
+remain in force. A confirmation in the plain interface uses a `y`/`n` prompt.
 
 To inspect the resulting file yourself in a Linux/macOS OS terminal:
 
@@ -264,8 +272,10 @@ Get-Content "$HOME\medtech-workspace\test_dir\hello.txt"
 ```
 
 For reliable results, give exact paths, exact file contents, and a short task.
-Break large jobs into smaller requests. Existing files are not silently overwritten;
-ask explicitly if you want overwrite or append behavior, then confirm it.
+Break large jobs into smaller requests. A normal create operation refuses an
+existing file; ask explicitly for overwrite or append behavior when that is what
+you intend. Full local mode does not add an approval prompt for those ordinary
+operations, so review the path and request before sending it.
 
 `exit`, `quit`, `/exit`, and Ctrl+Q leave the full-screen app. Messages already
 committed remain saved; there is no separate save command. An interrupted turn
@@ -304,7 +314,8 @@ Run these **outside** the chat. Global flags go before subcommands. `ID` and
 | Startup flag | Default / details |
 | --- | --- |
 | `--mode {local,sandbox}` | Prompt if omitted for a new chat |
-| `--workspace PATH` | `~/medtech-workspace`; **local mode only** |
+| `--workspace PATH` | Initial local current directory, default `~/medtech-workspace`; **local mode only** |
+| `--permissions {full,workspace}` | Override the saved local permission mode for this launch |
 | `--model TAG` | `MEDTECH_MODEL`, otherwise `qwen2.5:7b` |
 | `--resume [ID]` | Optional numeric ID; omitted ID selects latest |
 | `--continue` | Select latest; mutually exclusive with `--resume` |
@@ -358,9 +369,14 @@ shell-style quoting, so an apostrophe in a fact can be enclosed in double quotes
 | `/tasks` | Show tasks for the current chat |
 | `/tasks ID` | Show tasks for another chat |
 | `/tasks all` | Show the latest 200 tasks across chats |
-| `/auto on` | Auto-approve ordinary writes, subject to the rules below |
-| `/auto off` | Ask before ordinary writes |
+| `/auto on` | Auto-approve ordinary sandbox writes; catastrophic local checks remain separate |
+| `/auto off` | Restore ordinary write approval in the sandbox; local ordinary operations stay automatic |
 | `/debug on`, `/debug off` | Enable or disable raw tool diagnostics in the private debug log |
+| `/permissions` | Show the current local permission mode |
+| `/permissions full` or `/permissions workspace` | Change and save the local permission mode |
+| `/permissions confirm on` or `/permissions confirm off` | Enable or disable catastrophic-operation confirmations |
+| `/details`, `/details on`, `/details off` | Toggle or select persistent Details mode |
+| `/theme` or `/theme NAME` | Open the theme selector or select a configured theme |
 | `exit`, `quit`, `/exit` | Leave MedTech |
 
 The sidebar and its context menu provide chat actions without typing commands.
@@ -381,8 +397,9 @@ draft is not saved or listed in the sidebar until its first message. A short
 title is taken from that first user message. Sessions include timestamps, mode, workspace, messages,
 proposed tool calls, results, and audit records. Each message is committed to disk
 as it is recorded; user input is committed before the first model request.
-Rejected model output and corrective messages are retained for diagnosis too, so
-the history view can include raw JSON and internal retry messages.
+Rejected model output and corrective messages are retained for diagnosis too.
+The default concise view hides that audit material; Details reveals it without
+changing what is saved.
 
 Use `/history` to find an ID and `/resume ID` to return to it, or exit and run
 `medtech --continue`. Latest means **most recently updated**, not necessarily the
@@ -394,7 +411,7 @@ facts, an extractive synopsis of older entries, and recent messages. Large entri
 are shortened for model input; their original versions remain in SQLite. The
 synopsis may omit older details and is not a perfect record of everything said.
 
-A fresh backend on resume starts at the workspace root: previous `cd` state is
+A fresh backend on resume starts at its saved initial directory: previous `cd` state is
 not restored after restart or `/resume`. `/new` reuses the active backend and its
 current directory. Ask `Show the current directory` if unsure.
 
@@ -446,29 +463,42 @@ immediately. Manual edits take precedence over already pending extraction.
 
 ## Local mode, Docker mode, and paths
 
-| Detail | Local | Sandbox |
+| Detail | Local | Docker sandbox |
 | --- | --- | --- |
-| Tool environment | Your computer, under your user account | Linux Docker container |
-| Workspace on host | `--workspace PATH`, default `~/medtech-workspace` | `~/medtech-files` |
-| Workspace seen by tools | Actual absolute host directory | `/workspace` |
-| Ordinary write approval on fresh launch | Ask | Automatic |
-| Docker required | No | Yes |
-| File persistence | Host files remain | Host bind-mounted files remain |
+| Tool environment | Your computer, under your OS account | Linux container |
+| Initial directory | `--workspace PATH` | `/workspace` |
+| Default permission scope | `full`: any path the OS permits | Main bind mount and explicitly configured extra mounts |
+| Home expansion | `~` and `~/...` expand to the local user's home | Expanded inside the container, still subject to allowed mount roots |
+| Ordinary operation approval | No extra prompt | Existing sandbox approval policy |
+| File persistence | Actual host files | Host bind-mounted files |
 
-### Local paths
+### Local paths and current directory
 
-Paths resolve relative to the backend's current directory. The application uses
-real absolute paths, resolving `..` and symlinks, and denies paths outside the
-workspace. An absolute path is allowed only if it remains inside that workspace.
-The `~` shorthand works for the startup `--workspace` option, but **not** for paths
-passed to file tools. Within chat, use workspace-relative paths such as
-`reports/notes.txt` instead of `~/reports/notes.txt`.
+The default **`full`** permission mode accepts absolute paths, `~`, and paths
+outside the initial directory. On Windows, native drive paths such as
+`C:\Users\Name\Desktop\test` work when the app runs on Windows. On Linux/macOS,
+use paths such as `/home/name/Desktop/test` or `~/Desktop/test`.
+Relative paths resolve against the backend's current directory. A tool `cd`
+changes that directory for subsequent tools; the status bar shows the actual
+absolute cwd. It does not change the working directory of your OS shell.
 
-A tool `cd` affects subsequent tools, not the directory of your OS shell. Starting
-`medtech` from the repository does not automatically make that repository the
-file workspace. To work there intentionally, launch with `--workspace .`.
+For example, ask: `Create a directory on my Desktop called test.` The tool must
+report the actual resolved path, and the post-execution check must confirm it.
+If the OS says permission denied or the filesystem is read-only, that error is
+reported; MedTech does not add `sudo`, elevate privileges, or try another path.
 
-### Sandbox mapping and lifecycle
+To restrict local tools, select **`workspace`** mode and configure
+`permissions.root` (or `MEDTECH_WORKSPACE_ROOT`). Paths and symlinks resolving
+outside that root are denied. `/permissions full` restores unrestricted local
+path resolution; Docker does not gain host-wide access from this command.
+
+The current directory persists between commands while that backend is active.
+A fresh backend on restart or `/resume` begins at its saved initial directory;
+`/new` reuses the existing backend and current directory.
+
+### Sandbox mapping and additional mounts
+
+The default mapping stays:
 
 ```text
 Host computer                         Container
@@ -476,28 +506,39 @@ Host computer                         Container
 ~/medtech-files/test_dir/hello.txt ->  /workspace/test_dir/hello.txt
 ```
 
-The container path in a tool result refers to this mapping. Look in
-`~/medtech-files` on your host, not your local-mode workspace. The CLI currently
-ignores `--workspace` in sandbox mode; custom sandbox bind paths are available only
-through the Python backend API.
+The CLI's `--workspace` option is local-only. Docker uses the main mapping above;
+optional `sandbox.extra_mounts` explicitly expose additional host directories:
 
-MedTech uses a long-lived container with a path-derived name such as
-`medtech-sandbox-<hash>`. Each tool call uses `docker exec`, with an explicit working
-directory. Compatible stopped containers are restarted; existing mount, user,
-image, and isolation settings are checked before reuse. Files persist between
-calls, sessions, and container restarts through the host bind mount.
+```json
+{
+  "sandbox": {
+    "extra_mounts": [
+      {"source": "/home/rayan/Documents", "target": "/mnt/documents", "read_only": true},
+      {"source": "/home/rayan/Exports", "target": "/mnt/exports", "read_only": false}
+    ]
+  }
+}
+```
 
-The container runs with no network, all capabilities dropped, no extra privileges,
-a read-only root filesystem, writable temporary space, and limits of 512 MB RAM,
-one CPU, and 128 processes. On Unix it runs with your host UID:GID. The shared
-workspace is writable and persistent; temporary container files are not a backup.
-Ollama runs outside the container, so the container's disabled network does not
-prevent the Python application from contacting your local Ollama service.
+The list is empty by default. Use existing absolute host directories and distinct
+absolute container targets. In chat, use container paths such as
+`/mnt/documents/notes.txt`; the host path is not the container path. Read-only
+mounts deny mutations. Changing the configured mounts affects sandbox startup;
+an existing incompatible container is reported rather than silently reused with
+incorrect paths. Exposing a directory makes its contents available to sandbox
+tools, so include only directories you intend to share.
 
-Docker Desktop must allow access to the shared host directory. A remote Docker
-daemon needs that directory available on the daemon's machine as well. Native
-Windows path/permission behavior can differ; WSL with a local Docker integration
-is another option. The automated Docker checks should be run on your setup.
+MedTech runs one long-lived container per compatible configuration, using
+`docker exec` with an explicit workdir for tools. The container has no network,
+all capabilities dropped, no extra privileges, a read-only root filesystem,
+writable temporary space, and limits of 512 MB RAM, one CPU, and 128 processes.
+On Unix it uses your host UID:GID. Bind-mounted files persist across tool calls
+and container restarts. Ollama runs outside that isolated container.
+
+Docker Desktop must allow the shared host directories. A remote Docker daemon
+needs matching directories on the daemon's machine. Native Windows path sharing
+can differ; WSL with a local Docker integration is another option. Run the local
+verifier on the platform you intend to use.
 
 ## Permissions and execution results
 
@@ -520,17 +561,25 @@ in natural language rather than calling them directly:
 
 The rules are enforced by application code:
 
-- Reads are automatic. A fresh local launch asks before ordinary writes; a fresh
-  sandbox launch automatically allows them.
-- `/auto on` changes ordinary write approval only. **Delete, overwrite, and append
-  always ask**, and an existing destination is not silently replaced by copy/move.
-- After reading file contents or search results in a turn, subsequent writes in
-  that turn require confirmation because the input could contain instructions.
-- `/auto` is runtime state, not a saved per-chat preference. `/new` and interactive
-  `/resume` retain the current setting, even when resuming another execution mode.
-  Use `/auto off` when you want to require ordinary write approval again.
-- Leaving the workspace and accessing protected credential names/directories
-  such as `.env`, `.ssh`, and `.aws` is denied by the path policy.
+- Local `full` mode removes the path jail and credential-name allow/deny lists.
+  Real OS permissions still apply. Local `workspace` mode enforces the configured
+  root; Docker remains restricted to its allowed bind mounts.
+- Ordinary local create/read/write/move/copy/delete operations do not add approval
+  prompts. A create still refuses an existing file unless overwrite/append was
+  explicitly requested. Copy/move do not silently replace an existing destination.
+- With `permissions.confirm_dangerous=true` (default), recursive deletion or
+  relocation of a filesystem/drive root, home directory, or its ancestor requires
+  a confirmation dialog. Overwriting/appending an actual raw block device, or a
+  Windows physical drive path, also requires confirmation.
+  Declining cancels it. Setting the option to `false` skips that application-level
+  prompt; it does not change OS permissions.
+- The project still exposes typed file/system tools, **not a general shell**.
+  Arbitrary commands such as `rm -rf`, `mkfs`, `dd`, fork bombs, and recursive
+  `chmod` cannot be executed through a shell tool because no such tool exists.
+  An unsupported tool call is blocked rather than treated as successful execution.
+- Docker keeps its previous approval behavior: ordinary writes may be automatic,
+  while delete/overwrite/append and writes following untrusted file reads can
+  require approval. `/auto` controls that sandbox behavior.
 
 Tools return a structured result with `success`, `exit_code`, `stdout`, `stderr`,
 `cwd`, and `duration` in seconds. Filesystem mutations also return `verified`
@@ -552,17 +601,99 @@ file writes accept up to 100,000 characters, directory listings show up to 200
 entries, and searches return up to 50 hits. Binary files are not supported by the
 text reader. Fixed network-info commands may be missing in a minimal container.
 
+## Concise output and Details
+
+Concise is the default. Intermediate model narration, plans, and tool arguments
+stay out of the transcript. While work runs, a compact animated indicator shows
+its status. Successful filesystem operations show a concrete verified outcome,
+for example `✓ Created /home/rayan/test_dir/hello.txt`. Failures show their actual
+reason, for example `✗ Permission denied (Ctrl+D for details)`.
+Requested read/list/system output is still shown when it is the relevant result.
+The display post-processor strips filler without changing the stored messages.
+
+Use the visible **Details** switch, **Ctrl+D**, or `/details` to reveal the full
+history of the current transcript: tool arguments, structured results, stderr,
+cwd/duration, verification evidence, guard rejections/retries, and recorded error
+text/tracebacks. Toggle it off to return to concise outcomes. This works
+retroactively because the underlying data remains in SQLite. The setting is saved
+in `ui.details` and applies to future launches. `/debug` separately controls raw
+file logging; it is not required to inspect stored details in the UI.
+
+## Themes and terminal appearance
+
+Use `/theme NAME` to switch directly, or **Ctrl+T** to open the theme and glyph
+selector without restarting. Built-in
+choices are **`neutral`** (dark, default), **`colorful`** (dark), and **`light`**.
+Your selection is saved in `ui.theme`. Markdown assistant replies support
+syntax-highlighted code blocks. The sidebar adapts to narrow windows, and the
+status bar shows model, local/Docker mode, cwd, permission mode, and Details state.
+
+Styling lives in `medtech/styles.tcss`; the theme catalog lives in
+`medtech/themes.json`. To add a personal theme without editing the package, create
+`MEDTECH_HOME/themes.json` with a mapping from a new theme name to Textual theme
+fields. For example:
+
+```json
+{
+  "my-dark": {
+    "primary": "#66b3ff",
+    "secondary": "#89a1b8",
+    "accent": "#66b3ff",
+    "background": "#11161d",
+    "surface": "#19222d",
+    "dark": true
+  }
+}
+```
+
+Select it with `/theme my-dark`. Invalid theme definitions fall back safely.
+Set `ui.ascii=true` or `MEDTECH_ASCII=true` if your terminal font cannot display
+the small status glyphs. Colors use Textual/Rich terminal capability handling;
+truecolor terminals give the most faithful palette, while reduced-color terminals
+receive the nearest supported colors. Themes do not require Internet access.
+
 ## Configuration
 
-Set environment variables **before launching** MedTech. The app does not load a
-`.env` file. There are no API keys to configure for local Ollama.
+Preferences are saved as JSON in `MEDTECH_HOME/config.json` (default
+`~/.medtech/config.json`). The app does not load a `.env` file. There are no API
+keys to configure for local Ollama. Environment overrides are read at launch:
+
+```json
+{
+  "permissions": {
+    "mode": "full",
+    "root": null,
+    "confirm_dangerous": true
+  },
+  "ui": {
+    "details": false,
+    "theme": "neutral",
+    "ascii": false
+  },
+  "sandbox": {
+    "extra_mounts": []
+  }
+}
+```
+
+`permissions.root` supplies the restriction root in workspace mode; otherwise the
+configured starting directory is used. Full mode uses that starting directory
+as cwd but permits other paths. UI commands save preferences for future launches;
+an explicitly set environment override takes precedence when starting again.
 
 | Variable | Default | Use |
 | --- | --- | --- |
 | `MEDTECH_MODEL` | `qwen2.5:7b` | Exact Ollama model tag; `--model` takes precedence |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama HTTP endpoint |
-| `MEDTECH_HOME` | `~/.medtech` | Directory holding the SQLite database and debug log |
+| `MEDTECH_HOME` | `~/.medtech` | Database, preferences, optional themes, and debug log |
 | `MEDTECH_NUM_CTX` | `16384` | Context window, `8192`–`32768`; `--num-ctx` takes precedence |
+| `MEDTECH_PERMISSIONS_MODE` | `full` | `full` or `workspace` for local tools |
+| `MEDTECH_WORKSPACE_ROOT` | Configured local root | Allowed root in workspace mode |
+| `MEDTECH_CONFIRM_DANGEROUS` | `true` | Confirm clearly catastrophic supported operations |
+| `MEDTECH_DETAILS` | `false` | Start with detailed execution history visible |
+| `MEDTECH_THEME` | `neutral` | Built-in or personal theme name |
+| `MEDTECH_ASCII` | `false` | Use ASCII status glyphs |
+| `MEDTECH_SANDBOX_MOUNTS` | `[]` | JSON list of extra bind-mount definitions |
 
 Linux/macOS example:
 
@@ -591,7 +722,8 @@ another machine, prompts, selected memories, and tool output go to that endpoint
 The application has no built-in authentication configuration for a hosted service.
 
 Model requests use temperature `0`, a default 16,384-token context setting, and
-up to 1,000 generated tokens per response. Qwen2.5 7B supports a maximum context
+up to 768 generated tokens per main response in concise mode (1,000 in Details
+mode, at most 400 for memory extraction). Qwen2.5 7B supports a maximum context
 window of 32,768 tokens. Configure the context through `--num-ctx N` or
 `MEDTECH_NUM_CTX`; more context uses more inference memory. Budgeting uses a
 conservative byte estimate without a separate tokenizer, reserving room for native
@@ -605,7 +737,8 @@ model input. Large generation tasks may still need smaller requests.
 | --- | --- |
 | Chat messages, facts, summaries, and task audit | `~/.medtech/medtech.db` |
 | Raw tool diagnostics when debug is enabled | `~/.medtech/debug.log` |
-| Local workspace files | `~/medtech-workspace/` |
+| Initial local directory | `~/medtech-workspace/`; full mode can also access other paths |
+| Saved permissions, Details, and theme preferences | `~/.medtech/config.json` |
 | Sandbox workspace files visible on the host | `~/medtech-files/` |
 | Ollama model weights | Managed separately by Ollama |
 | Python dependencies | The virtual environment you installed into |
@@ -614,8 +747,9 @@ The SQLite database is not encrypted by MedTech. It can contain user messages,
 file contents returned by tools, arguments, and rejected model output. Automatic
 extraction is instructed to omit secrets, but this is not a guarantee that a
 message or fact is safe to retain. Review `/memory` and avoid submitting secrets.
-Workspace path restrictions do not encrypt logs or protect files from other
-programs running as your user.
+Workspace-mode restrictions do not encrypt logs or protect files from other
+programs running as your user. In full local mode, tools have your user account's
+filesystem reach; there is no additional credential-file deny list.
 
 To back up the database, exit MedTech and other processes using that database,
 then copy it to a backup location. For the default Linux/macOS location:
@@ -663,10 +797,10 @@ workspaces, Docker image, or Ollama downloads.
 | Model not found / HTTP error | Run `ollama list`; pull an available tag and pass it with `--model TAG`. |
 | Slow response or timeout | Test with `ollama run TAG`, inspect `ollama ps`, use a model your hardware supports, and make requests smaller. A turn may need multiple calls. |
 | Invalid JSON / retry or step limit reached | The model did not produce a valid supported response, or completion lacked evidence. Inspect `/tasks`; retry with a shorter explicit request. Earlier writes may already exist. |
-| It says a task failed | Inspect `stderr`, `exit_code`, and the absolute path. Check permissions and whether the destination already exists. |
+| It says a task failed | Press Ctrl+D for the exact `stderr`, exit code, and verified path. OS permission/read-only errors cannot be fixed by changing app permission mode. |
 | Cannot find a created file | Check the tool's verified path and active mode. Local defaults to `~/medtech-workspace`; sandbox files appear under `~/medtech-files`. |
-| Outside workspace / protected path denied | Choose a path inside the workspace. A broader local workspace must be chosen at launch in a new chat; blocked credential paths remain blocked. |
-| Writes still ask after `/auto on` | Deletes, append/overwrite, and writes following untrusted file reads still need confirmation. |
+| Outside workspace denied | Check `/permissions`. Select `/permissions full` for local access anywhere, or choose a suitable `permissions.root` in workspace mode. Docker is limited to configured mounts. |
+| An operation asks for confirmation | Local catastrophic operations ask when enabled. Docker retains delete/overwrite/tainted-write approvals; ordinary local operations should not prompt. |
 | Docker missing or daemon inaccessible | Start Docker Desktop/daemon and run `docker info` from the same terminal/user. Local mode works without Docker. |
 | Docker image pull fails | Pre-pull `python:3.12-alpine` with network access; check registry access and disk space. |
 | Sandbox bind mount / permission error | Check host `~/medtech-files` permissions, Docker Desktop sharing, and whether the daemon is local. |
@@ -732,7 +866,9 @@ On PowerShell, set `$env:MEDTECH_MODEL = "YOUR_INSTALLED_TAG"`, then run the Pyt
 command. The verifier uses `MEDTECH_MODEL`, not a `--model` option.
 
 The verifier prints a PASS/FAIL per check and exits nonzero on failure. It covers
-a headless UI launch that does not require Ollama, real model responses, saved
+a headless UI launch and concise-output check without Ollama, an actual full-access
+write/read/delete in a temporary directory under your home (outside the project),
+real model responses, saved
 sessions, name recall after process restart and in a new chat, local and Docker
 folder/file creation, actual host/container read-back,
 chat/memory commands, malformed calls, unsupported claims, operation failure, and
@@ -745,24 +881,37 @@ The checks print their current results when run; a previous cloud or local run d
 not establish that your selected model, terminal, or Docker platform works. Run
 the verifier on the machine where you intend to use the assistant.
 
-Development validation for this update: **112 pytest tests passed, none skipped**,
-including actual Docker execution and headless Textual interaction tests. Ollama
-was unavailable; the local verifier reported **3 passed and 6 failed** because
-model checks or their prerequisites required Ollama. Real Qwen replies and native
-tool selection still need validation on your own machine.
+This update passed **200 pytest tests with no skips**, including three real Docker
+checks. The cloud verifier reported **4 passes and 7 failures**: six checks needed
+unavailable Ollama or a dependent prerequisite; the temporary-home write check
+hit this cloud machine's read-only home directory. Full-access paths and `~` were
+also tested using isolated writable temporary directories. Real model selection,
+physical terminal behavior, and home-directory writes need verification locally.
 
-Headless layout examples: [wide terminal](artifacts/ui-wide.svg) and
-[narrow terminal](artifacts/ui-narrow.svg). These are exported from the actual
-Textual test harness, without Ollama.
+Automated real-model checks remain in temporary restricted workspaces and do not
+authorize destructive proposals. The separate full-access check uses explicit
+write/read/delete calls in its own temporary home directory, which it cleans up.
+
+Current UI examples are exported by the headless test harness with synthetic
+conversations. They do not require Ollama:
+
+| Empty chat | Successful task, concise |
+| --- | --- |
+| ![Empty chat](docs/screenshots/empty.svg) | ![Successful concise task](docs/screenshots/success-concise.svg) |
+| Failure, concise | Same failure, Details on |
+| ![Concise failure](docs/screenshots/failure-concise.svg) | ![Failure details](docs/screenshots/failure-details.svg) |
+
+![Sidebar with grouped chats](docs/screenshots/sidebar-grouped.svg)
 
 ## How it works and project map
 
 ```text
-Your message -> SQLite commit -> model streams a provisional JSON answer/action
+Your message -> SQLite commit -> model proposes an answer/action
              -> strict parser -> approval/security policy
              -> local tools OR docker exec in the persistent container
              -> structured result + filesystem verification -> SQLite
              -> result returned to model -> next action or checked final answer
+             -> concise outcome OR Details view (full saved history retained)
 Background fact extraction -> schema validation -> durable user facts in SQLite
 ```
 
@@ -777,7 +926,11 @@ all generated answers correct.
 | --- | --- |
 | `medtech/__main__.py` | `python -m medtech` entry point |
 | `medtech/cli.py` | Startup options, plain compatibility interface, and slash commands |
-| `medtech/tui.py` | Textual sidebar, transcript, multiline editor, and background UI work |
+| `medtech/tui.py` | Sidebar, concise/Details transcript, editor, and background UI work |
+| `medtech/styles.tcss` | Shared responsive terminal styling and modal appearance |
+| `medtech/themes.py`, `medtech/themes.json` | Built-in and personal theme loading |
+| `medtech/settings.py` | Persisted permission, UI, and sandbox preferences |
+| `medtech/presentation.py` | Display-only concise outcome/filler processing |
 | `medtech/tui_dialogs.py` | Chat, tool-approval, and memory dialogs |
 | `medtech/ollama.py` | Native function schemas, response normalization, and tagged-call fallback |
 | `medtech/agent.py` | Ollama HTTP client, config, context budgeting, strict parsing, and agent loop |

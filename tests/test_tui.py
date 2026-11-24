@@ -25,7 +25,8 @@ class FakeLLM:
 
 
 @pytest.fixture
-def tui_state(tmp_path):
+def tui_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEDTECH_HOME", str(tmp_path / "user-data"))
     store = Store(tmp_path / "chats.db")
     backend = LocalBackend(str(tmp_path / "files"))
     yield store, backend
@@ -279,10 +280,14 @@ async def test_keyboard_sidebar_selection_f2_and_delete_confirmation(tui_state):
 
 
 @pytest.mark.asyncio
-async def test_local_tools_use_permission_dialogs_and_verified_real_files(tui_state):
+async def test_local_tools_use_permission_dialogs_and_verified_real_files(tui_state, monkeypatch):
     from textual.widgets import Collapsible
 
+    from medtech import policy
     store, backend = tui_state
+    # Isolate the approval dialog/worker wiring from ordinary local permissions.
+    monkeypatch.setattr(policy, "check", lambda *args, **kwargs:
+                        policy.Decision("confirm", "danger", "Simulated dangerous operation"))
     responses = iter([
         {"say": "", "action": {"tool": "mkdir", "args": {"path": "test_dir"}}},
         {"say": "", "action": {"tool": "write_file", "args": {"path": "test_dir/hello.txt", "content": "hi"}}},
@@ -295,7 +300,9 @@ async def test_local_tools_use_permission_dialogs_and_verified_real_files(tui_st
                 return super().__call__(messages)
             return json.dumps(next(responses))
 
-    app = MedTechApp(Config(), backend, store, llm=ToolLLM(), auto=False)
+    cfg = Config()
+    cfg.ui.details = True
+    app = MedTechApp(cfg, backend, store, llm=ToolLLM(), auto=False)
     async with app.run_test(size=(140, 42)) as pilot:
         await app.send_message("Create folder `test_dir` with file `hello.txt` containing 'hi'")
         await eventually(pilot, lambda: bool(app.screen.query("#tool-allow")))
@@ -397,7 +404,9 @@ async def test_streamed_draft_is_provisional_and_unsupported_claim_is_discarded(
 
     monkeypatch.setattr(agent_module, "chat", streamed_chat)
     monkeypatch.setattr(tui_module, "chat", streamed_chat)
-    app = MedTechApp(Config(), backend, store)
+    cfg = Config()
+    cfg.ui.details = True
+    app = MedTechApp(cfg, backend, store)
     async with app.run_test(size=(140, 42)) as pilot:
         try:
             await app.send_message("Create folder phantom")
@@ -444,7 +453,9 @@ async def test_live_ollama_deltas_are_provisional_until_final_validation(tui_sta
         return io.BytesIO(json.dumps({"message": {"content": '{"facts":[]}'}}).encode())
 
     monkeypatch.setattr(agent.urllib.request, "urlopen", local_response)
-    app = MedTechApp(Config(), backend, store)
+    cfg = Config()
+    cfg.ui.details = True
+    app = MedTechApp(cfg, backend, store)
     async with app.run_test(size=(120, 36)) as pilot:
         try:
             await app.send_message("Say hello to Rayan")
