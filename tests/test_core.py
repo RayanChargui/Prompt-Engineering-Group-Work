@@ -107,14 +107,16 @@ def test_bad_calls_retry_and_unknown_tool_is_blocked(tmp_path):
     assert any('"success": false' in m["content"] for m in agent.llm.calls[-1])
 
 
-def test_failure_cannot_become_success(tmp_path, capsys):
+def test_failure_cannot_become_success(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("MEDTECH_HOME", str(tmp_path / "logs"))
     agent = make_agent(tmp_path, [reply("", "write_file", path="/etc/no", content="hi"),
         reply("I created file /etc/no"), reply("The write failed: outside the workspace.")], debug=True)
     agent.turn("write outside")
     result = json.loads(agent.store.tasks(agent.sid)[0]["output"])
     assert not result["success"] and result["exit_code"] != 0 and result["stderr"]
     assert not any(e == ("say", "I created file /etc/no") for e in agent.ui.log)
-    debug = capsys.readouterr().err
+    assert not capsys.readouterr().err
+    debug = (tmp_path / "logs" / "debug.log").read_text()
     assert 'DEBUG tool' in debug and 'DEBUG result' in debug
     assert '"success": false' in debug and '"path": "/etc/no"' in debug
 
