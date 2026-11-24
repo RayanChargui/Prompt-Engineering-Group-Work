@@ -131,3 +131,49 @@ def test_unreachable_ollama_keeps_user_input_without_traceback(tmp_path, monkeyp
     store = Store()
     assert store.messages(store.latest_session()["id"])[0]["content"] == "Keep this message"
     store.close()
+
+
+def test_interactive_launch_uses_sidebar_ui(tmp_path, monkeypatch):
+    """A real-terminal launch selects the TUI and forwards saved session/options."""
+    from medtech import tui
+    monkeypatch.setenv("MEDTECH_HOME", str(tmp_path / "data"))
+    store = Store()
+    workspace = str(tmp_path / "workspace")
+    sid = store.new_session("local", workspace)
+    store.add_message(sid, "user", "Saved chat")
+    store.close()
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    launched = {}
+
+    class FakeApp:
+        def __init__(self, cfg, backend, store, **kwargs):
+            launched.update(cfg=cfg, backend=backend, **kwargs)
+        def run(self):
+            launched["ran"] = True
+
+    monkeypatch.setattr(tui, "MedTechApp", FakeApp)
+    assert cli.main(["--continue", "--num-ctx", "8192", "--debug"]) is None
+    assert launched["ran"] and launched["sid"] == sid
+    assert launched["backend"].root == workspace
+    assert launched["cfg"].num_ctx == 8192
+    assert launched["debug"] is True
+
+
+def test_explicit_plain_and_debug_command(cli_state):
+    store, agent, output = cli_state
+    agent.debug = False
+    cli.command("/debug on", agent, store)
+    assert agent.debug is True
+    cli.command("/debug off", agent, store)
+    assert agent.debug is False
+    assert "debug.log" in output.getvalue()
+    assert cli.build_parser().parse_args(["--plain", "--num-ctx", "8192"]).plain
+
+
+def test_invalid_context_option_has_clear_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEDTECH_HOME", str(tmp_path))
+    output = io.StringIO()
+    monkeypatch.setattr(cli, "c", Console(file=output, color_system=None))
+    assert cli.main(["--num-ctx", "99999", "--mode", "local"]) == 1
+    assert "32768" in output.getvalue()

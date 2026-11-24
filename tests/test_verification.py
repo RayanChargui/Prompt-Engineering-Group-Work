@@ -48,3 +48,21 @@ def test_creation_artifact_without_accepted_final_is_not_a_pass(tmp_path, monkey
     monkeypatch.setattr(verifier, "Agent", StoppedAgent)
     with pytest.raises(RuntimeError, match="accepted final completion"):
         verifier.real_creation(LocalBackend(str(tmp_path / "workspace")), tmp_path / "check.db")
+
+
+def test_headless_ui_check_does_not_contact_ollama(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("verify_local_ui", SCRIPT)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    calls = []
+
+    def unexpected_model_call(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("Headless startup must not contact Ollama")
+
+    import medtech.agent
+    monkeypatch.setattr(medtech.agent.urllib.request, "urlopen", unexpected_model_call)
+    monkeypatch.setenv("MEDTECH_HOME", str(tmp_path / "data"))
+    verifier.ui_check(tmp_path)
+    assert not calls

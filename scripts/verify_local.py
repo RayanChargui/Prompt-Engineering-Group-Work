@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run acceptance checks against real local Ollama, files, SQLite, and Docker."""
 import argparse
+import asyncio
 import contextlib
 import io
 import json
@@ -111,6 +112,36 @@ def real_creation(backend: object, db: Path) -> None:
         store.close()
 
 
+def ui_check(root: Path) -> None:
+    """Launch the real terminal UI headlessly and open a blank draft without Ollama."""
+    from medtech.tui import MedTechApp
+
+    async def exercise() -> None:
+        store = Store(str(root / "ui.db"))
+        try:
+            backend = LocalBackend(str(root / "ui-workspace"))
+            sid = store.new_session("local", backend.host_root)
+            store.add_message(sid, "user", "Saved UI smoke-test message")
+            original = list(store.messages(sid))
+            app = MedTechApp(Config(), backend, store, sid=sid)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                require(app.is_running, "Textual application did not start")
+                require(len(app.query("#sidebar")) == 1, "Conversation sidebar is missing")
+                require(len(app.query("#message-input")) == 1, "Multiline editor is missing")
+                await pilot.press("ctrl+n")
+                await pilot.pause()
+                require(app.sid is None, "New-chat keyboard action did not open a blank draft")
+                require(not app.query_one("#message-input").text, "New-chat editor is not empty")
+                require(len(store.sessions()) == 1, "An empty draft was persisted as a sidebar conversation")
+                require([tuple(row) for row in store.messages(sid)] == [tuple(row) for row in original],
+                        "Opening a new draft changed the previous saved conversation")
+        finally:
+            store.close()
+
+    asyncio.run(exercise())
+
+
 def cli_checks(root: Path) -> None:
     """Exercise public chat and memory commands against a separate real database."""
     from medtech.cli import command
@@ -197,6 +228,7 @@ def main() -> int:
         try:
             cfg = Config()
             print(f"Using real Ollama at {cfg.url}, model {cfg.model}; temporary data at {root}", flush=True)
+            check("headless Textual UI launch and new-chat action", lambda: ui_check(root))
             check("Ollama responds with valid agent JSON", lambda: parse(chat(cfg, [
                 {"role": "user", "content": 'Reply exactly {"say":"ready","action":null}'}])))
             check("session saved and durable user fact extracted", lambda: run_worker("remember", root))
@@ -229,7 +261,7 @@ def main() -> int:
                 os.environ.pop("MEDTECH_HOME", None)
             else:
                 os.environ["MEDTECH_HOME"] = previous
-    print(f"{8 - len(failures)} passed; {len(failures)} failed. No required checks are skipped.")
+    print(f"{9 - len(failures)} passed; {len(failures)} failed. No required checks are skipped.")
     return 1 if failures else 0
 
 

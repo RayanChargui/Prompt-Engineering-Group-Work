@@ -59,8 +59,8 @@ that is the container, not necessarily your host computer.
 | Component | Needed for |
 | --- | --- |
 | Python **3.9 or newer**, with `venv` and `pip` | Running MedTech |
-| Ollama and an installed compatible chat model | AI replies and automatic memory extraction |
-| `rich` | Terminal interface; installed automatically with MedTech |
+| Recent Ollama with native tool calling/streaming support, and an installed compatible chat model | AI replies and automatic memory extraction |
+| `textual` and `rich` | Full-screen terminal interface and compatible plain output; installed automatically |
 | Docker with a reachable daemon | Sandbox mode and real Docker tests only |
 | `pytest` | Development tests; installed through the `dev` extra |
 
@@ -69,11 +69,12 @@ Install Python from [python.org](https://www.python.org/downloads/), Ollama from
 [Docker's installation guide](https://docs.docker.com/get-started/get-docker/).
 On Linux, your distribution may package Python's `venv` support separately.
 
-The configured default model is **`qwen3.5:7b`**, matching the project's requested
-Qwen 3.5 7B setup. This is a model tag, not a bundled download. Tag availability
-must be checked on your machine; use an exact available/installed tag with
-`--model` or `MEDTECH_MODEL` if it differs. MedTech does not silently substitute a
-model or download weights for you.
+The configured default is **Qwen2.5 7B**, Ollama tag **`qwen2.5:7b`**. This
+model supports a maximum context window of **32,768 tokens**. MedTech defaults to
+16,384 to limit memory use; choose `--num-ctx 32768` or set `MEDTECH_NUM_CTX` to
+use a larger window. This is a model tag, not a bundled download. Use an exact
+installed tag with `--model` or `MEDTECH_MODEL` when overriding it; MedTech does
+not silently substitute a model or download weights for you.
 
 Model weights and inference need several GB of disk space and memory; the actual
 requirements depend on the tag, quantization, and context size. GPU acceleration
@@ -139,8 +140,8 @@ Leave that process running. In another terminal:
 
 ```sh
 ollama list
-ollama pull qwen3.5:7b
-ollama run qwen3.5:7b
+ollama pull qwen2.5:7b
+ollama run qwen2.5:7b
 ```
 
 The pull command requires an available tag and Internet access. If it reports
@@ -186,14 +187,53 @@ accepts `sandbox`/`s`/`1`, `local`/`l`/`2`, or `exit`/`quit`/`q`.
 There are **two different command locations**:
 
 - **OS terminal:** installation, `ollama`, `docker`, `medtech --help`, and launch commands.
-- **Inside MedTech's chat prompt:** ordinary-language requests and `/` commands.
+- **Inside MedTech's message editor:** ordinary-language requests and `/` commands.
 
 Typing `mkdir reports` in the OS terminal runs your shell's command. Typing it
 inside MedTech sends text to the model; it is not a direct shell command. Prefer
 clear requests such as `Create a folder named reports.` There is no `/mkdir` or
 `/shell` shortcut.
 
-Here is a first session. Enter one line at a time and wait for the response:
+Interactive terminals open a Textual full-screen interface with a conversation
+sidebar, scrollable transcript, multiline message editor, and status line:
+
+```text
+┌ Conversations ───────────┬ MedTech ──────────────────────────────────┐
+│ New chat                │ You: My name is Rayan.                   │
+│ Search chats…           │ Assistant: Nice to meet you, Rayan.      │
+│ Today                   │                                          │
+│   First experiment      │ Scrollable conversation and tool results │
+│   Python project        │                                          │
+│                         ├──────────────────────────────────────────┤
+│ Memory                  │ Write a message…                         │
+│ qwen2.5:7b · Local      │ Enter: newline       Ctrl+Enter: Send    │
+└─────────────────────────┴──────────────────────────────────────────┘
+```
+
+The sidebar groups chats under Today, Yesterday, Previous 7 days, and Older,
+with the current chat highlighted. Click a chat or focus the list and use arrow
+keys plus Enter to resume it; search to find older
+conversations. The Memory view lists durable facts separately from chat history.
+Model output appears as a provisional streaming draft; a final answer becomes
+accepted only after parsing and execution-evidence checks. Rejected drafts or
+action proposals are discarded rather than presented as completed work.
+
+| Key / action | Behavior |
+| --- | --- |
+| **Ctrl+Enter** or Send | Submit the multiline message |
+| **Enter** | Insert a newline in the message editor |
+| **Ctrl+N** | New conversation |
+| **Ctrl+B** | Show or hide the conversation sidebar |
+| **Ctrl+F** | Focus chat search |
+| **F2** | Rename the selected conversation |
+| **Delete** | With the chat list focused, delete the selected conversation after confirmation |
+| **Ctrl+O** or right-click a chat | Open its context menu |
+| **Escape** | Cancel the active turn; completed operations stay saved |
+| **Ctrl+Q** | Quit |
+| **Memory** button | Open the saved-fact view and remove selected facts |
+
+Slash commands are still supported in the message editor. Here is a first
+session; send each request separately with Ctrl+Enter:
 
 ```text
 My name is Rayan.
@@ -207,8 +247,9 @@ exit
 ```
 
 Replace `1` with the actual session ID shown by your app. Local file creation asks
-for permission; review the proposed tool and arguments, then answer `y` to allow
-or `n` to refuse. The default is refusal. Denying an action stops the current turn.
+for permission; review the proposed tool and arguments in the confirmation
+dialog and allow or deny it. Denying an action stops the current turn. The plain
+compatibility interface uses a `y`/`n` prompt with refusal as the default.
 
 To inspect the resulting file yourself in a Linux/macOS OS terminal:
 
@@ -226,9 +267,14 @@ For reliable results, give exact paths, exact file contents, and a short task.
 Break large jobs into smaller requests. Existing files are not silently overwritten;
 ask explicitly if you want overwrite or append behavior, then confirm it.
 
-`exit`, `quit`, and `/exit` leave MedTech. Ctrl+C during a turn interrupts it while
-keeping messages already saved; at the input prompt Ctrl+C exits. There is no
-separate save command. An interrupted turn is not automatically rerun on resume.
+`exit`, `quit`, `/exit`, and Ctrl+Q leave the full-screen app. Messages already
+committed remain saved; there is no separate save command. An interrupted turn
+is not automatically rerun on resume. The interface remains responsive while
+model requests and background fact extraction run.
+
+For a traditional line prompt, launch with `--plain`. Piped/noninteractive
+stdin or stdout automatically uses this compatibility interface; it supports
+the same slash commands without the full-screen sidebar or multiline editor.
 
 ## OS terminal command reference
 
@@ -245,7 +291,9 @@ Run these **outside** the chat. Global flags go before subcommands. `ID` and
 | `medtech --resume ID` | Resume the specified chat |
 | `medtech --resume` | Resume the most recently updated chat |
 | `medtech --continue` | Same latest-chat behavior |
-| `medtech --debug --mode local` | Launch with detailed tool diagnostics on stderr |
+| `medtech --debug --mode local` | Log detailed tool diagnostics to the private data-directory log |
+| `medtech --num-ctx 32768 --mode local` | Use the model's maximum supported context window |
+| `medtech --plain --mode local` | Use the line-oriented compatibility interface |
 | `medtech sessions` | List up to 50 most recently updated chats, then exit |
 | `medtech history` | List chats, then exit |
 | `medtech history ID` | Print the saved transcript, then exit |
@@ -257,10 +305,12 @@ Run these **outside** the chat. Global flags go before subcommands. `ID` and
 | --- | --- |
 | `--mode {local,sandbox}` | Prompt if omitted for a new chat |
 | `--workspace PATH` | `~/medtech-workspace`; **local mode only** |
-| `--model TAG` | `MEDTECH_MODEL`, otherwise `qwen3.5:7b` |
+| `--model TAG` | `MEDTECH_MODEL`, otherwise `qwen2.5:7b` |
 | `--resume [ID]` | Optional numeric ID; omitted ID selects latest |
 | `--continue` | Select latest; mutually exclusive with `--resume` |
-| `--debug` | Off; logs tool calls, full arguments, and raw results |
+| `--debug` | Off; logs tool calls, full arguments, and raw results to `MEDTECH_HOME/debug.log` |
+| `--num-ctx N` | `MEDTECH_NUM_CTX`, otherwise `16384`; accepted range `8192`–`32768` |
+| `--plain` | Use the line-oriented compatibility interface |
 | `-h`, `--help` | Print help |
 
 Resume uses the saved chat's mode and workspace, overriding supplied `--mode` or
@@ -287,7 +337,7 @@ compatible stopped container again; bind-mounted files remain on disk.
 
 ## Commands inside MedTech
 
-Use these at the **MedTech prompt**, without a `medtech` prefix. For multiword
+Send these from the **MedTech message editor**, without a `medtech` prefix. For multiword
 arguments, plain text usually works; quotes can group names. Slash commands use
 shell-style quoting, so an apostrophe in a fact can be enclosed in double quotes.
 
@@ -295,7 +345,7 @@ shell-style quoting, so an apostrophe in a fact can be enclosed in double quotes
 | --- | --- |
 | `/help` | Show the built-in command help |
 | `/new` | Open a new chat in the current execution environment |
-| `/history`, `/chats`, `/sessions` | List up to 50 chats, most recently updated first |
+| `/history`, `/chats`, `/sessions` | Focus the sidebar and show up to 50 chat IDs/titles, most recently updated first |
 | `/history ID` | Show that chat's persisted messages and tool data |
 | `/resume ID` | Switch to an existing chat and its recorded workspace |
 | `/rename ID TITLE` | Rename it, e.g. `/rename 12 Python project` |
@@ -310,11 +360,12 @@ shell-style quoting, so an apostrophe in a fact can be enclosed in double quotes
 | `/tasks all` | Show the latest 200 tasks across chats |
 | `/auto on` | Auto-approve ordinary writes, subject to the rules below |
 | `/auto off` | Ask before ordinary writes |
-| `/menu`, `m` | Display the shortcut buttons |
+| `/debug on`, `/debug off` | Enable or disable raw tool diagnostics in the private debug log |
 | `exit`, `quit`, `/exit` | Leave MedTech |
 
-At the chat prompt, shortcut `1` lists chats, `2` shows current tasks, `3` lists
-memory, and `4` shows help. These mappings differ from the startup mode prompt.
+The sidebar and its context menu provide chat actions without typing commands.
+Delete from the sidebar requires confirmation. Chat IDs shown by `/history` and
+memory IDs shown by `/memory` remain valid for slash commands.
 
 **Chat IDs and memory IDs are separate.** `/delete 3` deletes chat 3; `/forget 3`
 deletes memory 3. Neither command deletes files created in a workspace. Deleting
@@ -325,8 +376,9 @@ or memory deletion.
 
 ### Conversation history
 
-Every ordinary launch creates a new session. A short title is taken from the
-first user message. Sessions include timestamps, mode, workspace, messages,
+Every ordinary launch opens a new chat draft. In the full-screen UI, an empty
+draft is not saved or listed in the sidebar until its first message. A short
+title is taken from that first user message. Sessions include timestamps, mode, workspace, messages,
 proposed tool calls, results, and audit records. Each message is committed to disk
 as it is recorded; user input is committed before the first model request.
 Rejected model output and corrective messages are retained for diagnosis too, so
@@ -348,9 +400,10 @@ current directory. Ask `Show the current directory` if unsure.
 
 ### Durable facts across chats
 
-After you send ordinary chat text, a separate lightweight request to the same
-local model extracts explicitly stated durable facts. This happens before the
-main reply. Extraction accepts only a validated JSON schema, with at most 10
+After a user turn, a background lightweight request to the same local model
+extracts explicitly stated durable facts. It does not block the UI or hold up
+the main reply; newly extracted facts appear when that background work finishes.
+Extraction accepts only a validated JSON schema, with at most 10
 facts per response and values up to 500 characters; malformed output or a model
 failure leaves memory unchanged. New values for the same property replace old
 ones. This is saved reference data, not model training or a change to its weights.
@@ -387,7 +440,9 @@ A new chat avoids that old transcript. The prompt's memory budget prioritizes
 recently updated facts, so an unusually large memory collection may not all fit.
 
 Manual memory commands and history views work without Ollama. AI replies and
-automatic fact extraction require Ollama.
+automatic fact extraction require Ollama. If you quit while an automatic memory
+update is pending, its result may not be saved; `/remember` saves an explicit fact
+immediately. Manual edits take precedence over already pending extraction.
 
 ## Local mode, Docker mode, and paths
 
@@ -504,9 +559,10 @@ Set environment variables **before launching** MedTech. The app does not load a
 
 | Variable | Default | Use |
 | --- | --- | --- |
-| `MEDTECH_MODEL` | `qwen3.5:7b` | Exact Ollama model tag; `--model` takes precedence |
+| `MEDTECH_MODEL` | `qwen2.5:7b` | Exact Ollama model tag; `--model` takes precedence |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama HTTP endpoint |
-| `MEDTECH_HOME` | `~/.medtech` | Directory holding the SQLite database |
+| `MEDTECH_HOME` | `~/.medtech` | Directory holding the SQLite database and debug log |
+| `MEDTECH_NUM_CTX` | `16384` | Context window, `8192`–`32768`; `--num-ctx` takes precedence |
 
 Linux/macOS example:
 
@@ -534,17 +590,21 @@ Keep `OLLAMA_URL` local for local-only processing. If you explicitly point it at
 another machine, prompts, selected memories, and tool output go to that endpoint.
 The application has no built-in authentication configuration for a hosted service.
 
-Model requests currently use temperature `0`, a 16,384-token context setting,
-and up to 1,000 generated tokens per response. Context/output settings are Python
-`Config` fields, not CLI flags or additional environment variables. Budgeting uses
-a conservative byte estimate without a separate tokenizer. Large responses may
-need smaller tasks or a developer adjustment to `Config`.
+Model requests use temperature `0`, a default 16,384-token context setting, and
+up to 1,000 generated tokens per response. Qwen2.5 7B supports a maximum context
+window of 32,768 tokens. Configure the context through `--num-ctx N` or
+`MEDTECH_NUM_CTX`; more context uses more inference memory. Budgeting uses a
+conservative byte estimate without a separate tokenizer, reserving room for native
+function definitions as well as the response. The UI retains the full
+persisted transcript even when older messages are summarized or shortened for
+model input. Large generation tasks may still need smaller requests.
 
 ## Data, privacy, backup, and updates
 
 | Item | Default location |
 | --- | --- |
 | Chat messages, facts, summaries, and task audit | `~/.medtech/medtech.db` |
+| Raw tool diagnostics when debug is enabled | `~/.medtech/debug.log` |
 | Local workspace files | `~/medtech-workspace/` |
 | Sandbox workspace files visible on the host | `~/medtech-files/` |
 | Ollama model weights | Managed separately by Ollama |
@@ -621,12 +681,14 @@ For tool diagnostics:
 
 ```sh
 medtech --debug --mode local --workspace ~/medtech-workspace
-# Capture stderr to a file if you need to inspect it:
-medtech --debug --mode local 2>medtech-debug.log
+# Inspect the log from another terminal (use MEDTECH_HOME if customized):
+tail -f "$HOME/.medtech/debug.log"
 ```
 
-Debug logging includes full proposed arguments and raw results, potentially with
-file contents or personal data. Review and redact logs before sharing them.
+Use `/debug on` or `/debug off` during a session to change logging without
+restarting. Diagnostics go to `MEDTECH_HOME/debug.log`, keeping the full-screen
+interface clear. The log includes full proposed arguments and raw results,
+potentially with file contents or personal data; review and redact it before sharing.
 
 ## Tests and real-service verification
 
@@ -638,7 +700,8 @@ python -m pytest -q
 ```
 
 The suite tests agent logic with a scripted LLM, SQLite persistence and migrations,
-CLI commands, real temporary local files, and mocked Docker transport behavior.
+CLI commands, headless Textual interaction, real temporary local files, and mocked
+Docker transport behavior.
 It does not require Ollama. Tests marked `docker` use the actual daemon and
 sandbox image, and automatically skip if the daemon is unavailable. If the daemon
 is present, image/runtime failures count as failures rather than skipped passes.
@@ -669,29 +732,38 @@ On PowerShell, set `$env:MEDTECH_MODEL = "YOUR_INSTALLED_TAG"`, then run the Pyt
 command. The verifier uses `MEDTECH_MODEL`, not a `--model` option.
 
 The verifier prints a PASS/FAIL per check and exits nonzero on failure. It covers
-real model responses, saved sessions, name recall after process restart and in a
-new chat, local and Docker folder/file creation, actual host/container read-back,
+a headless UI launch that does not require Ollama, real model responses, saved
+sessions, name recall after process restart and in a new chat, local and Docker
+folder/file creation, actual host/container read-back,
 chat/memory commands, malformed calls, unsupported claims, operation failure, and
 corrupt database handling. It uses temporary data and a uniquely named test
 container, then cleans up its own resources. It does not install model weights
 or change your normal chat data. Missing Ollama/model/Docker is a **failed check**
 in this verifier, not a skipped success. CPU runs may take several minutes.
 
-Implementation validation in the cloud development environment completed with
-**66 pytest tests passed and none skipped**, including real Docker tests. Ollama
-was unavailable there: the real-service verifier reported **2 passed and 6 failed**
-due to missing Ollama or dependent prerequisites. Those results do not establish
-that your selected model or platform works; run the verifier on your machine.
+The checks print their current results when run; a previous cloud or local run does
+not establish that your selected model, terminal, or Docker platform works. Run
+the verifier on the machine where you intend to use the assistant.
+
+Development validation for this update: **112 pytest tests passed, none skipped**,
+including actual Docker execution and headless Textual interaction tests. Ollama
+was unavailable; the local verifier reported **3 passed and 6 failed** because
+model checks or their prerequisites required Ollama. Real Qwen replies and native
+tool selection still need validation on your own machine.
+
+Headless layout examples: [wide terminal](artifacts/ui-wide.svg) and
+[narrow terminal](artifacts/ui-narrow.svg). These are exported from the actual
+Textual test harness, without Ollama.
 
 ## How it works and project map
 
 ```text
-Your message -> SQLite commit -> local model fact extraction
-             -> model proposes JSON answer/action
+Your message -> SQLite commit -> model streams a provisional JSON answer/action
              -> strict parser -> approval/security policy
              -> local tools OR docker exec in the persistent container
              -> structured result + filesystem verification -> SQLite
              -> result returned to model -> next action or checked final answer
+Background fact extraction -> schema validation -> durable user facts in SQLite
 ```
 
 The LLM suggests; the application decides whether execution is allowed. Tool
@@ -704,14 +776,17 @@ all generated answers correct.
 | File / directory | Responsibility |
 | --- | --- |
 | `medtech/__main__.py` | `python -m medtech` entry point |
-| `medtech/cli.py` | Terminal UI, startup options, and slash commands |
+| `medtech/cli.py` | Startup options, plain compatibility interface, and slash commands |
+| `medtech/tui.py` | Textual sidebar, transcript, multiline editor, and background UI work |
+| `medtech/tui_dialogs.py` | Chat, tool-approval, and memory dialogs |
+| `medtech/ollama.py` | Native function schemas, response normalization, and tagged-call fallback |
 | `medtech/agent.py` | Ollama HTTP client, config, context budgeting, strict parsing, and agent loop |
 | `medtech/policy.py` | Tool schemas, approval rules, and untrusted-text handling |
 | `medtech/ops.py` | Shared filesystem/system operations and post-execution checks |
 | `medtech/backends.py` | Local execution and Docker lifecycle/mount/transport |
 | `medtech/store.py` | SQLite schema versions, migrations, sessions, messages, tasks, and facts |
 | `medtech/memory.py` | Validated fact extraction and bounded memory prompt |
-| `medtech/logo.py` | Terminal startup animation |
+| `medtech/logo.py` | Plain-interface startup animation |
 | `tests/` | Offline acceptance tests and optional real Docker tests |
 | `scripts/verify_local.py` | Real-service acceptance checks |
 | `scripts/verify_local.sh` | Shell launcher for the verifier |
@@ -720,4 +795,5 @@ all generated answers correct.
 For development, `Agent` accepts an injectable callable LLM interface. A fake
 client receives the message list and returns raw JSON text, allowing deterministic
 malformed-response and hallucination tests without a running model. Runtime
-uses the standard-library HTTP client against Ollama's `/api/chat` endpoint.
+uses the standard-library HTTP client against Ollama's `/api/chat` endpoint,
+processing its newline-delimited JSON streaming deltas without a cloud SDK.
