@@ -1,8 +1,7 @@
-"""medtech - terminal agent. Pick sandbox (Docker) or local, chat, RAG over your documents."""
+"""Terminal UI for local tools, persistent conversations, and user memory."""
 import argparse
 import json
 import shlex
-import threading
 from datetime import datetime
 
 from rich import box
@@ -14,20 +13,20 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from .agent import Agent, Config, LLMError, chat, make_embedder
+from .agent import Agent, Config, LLMError
 from .backends import BackendError, LocalBackend, SandboxBackend
 from .logo import draw_logo
-from .rag import RAG
-from .store import Store
+from .store import Store, StoreError
 
 c = Console()
 ACCENT, SOFT, DIM = "#3fc1e8", "#e8fbff", "#2b6f87"
-HELP = f"""[bold {ACCENT}]Chat[/]      say what you want: files, folders, ip config, questions about your documents
-[bold {ACCENT}]/ingest <path>[/]   add a PDF / text file or a folder to the knowledge base
-[bold {ACCENT}]/docs[/]  list documents      [bold {ACCENT}]/forget <id>[/]  remove one      [bold {ACCENT}]/rag on|off[/]  use documents in answers
-[bold {ACCENT}]/auto on|off[/]   auto-approve safe writes (deletes and overwrites always ask)
-[bold {ACCENT}]/sessions[/]  all sessions      [bold {ACCENT}]/history [id][/]  one chat      [bold {ACCENT}]/tasks [id|all][/]  executed actions
-[bold {ACCENT}]/menu[/] or [bold {ACCENT}]m[/]  show the buttons      [bold {ACCENT}]/help[/]      [bold {ACCENT}]exit[/]  leave"""
+HELP = f"""[bold {ACCENT}]/new[/] new chat    [bold {ACCENT}]/history[/] or [bold {ACCENT}]/chats[/] list chats
+[bold {ACCENT}]/resume <id>[/] resume chat    [bold {ACCENT}]/history <id>[/] show messages
+[bold {ACCENT}]/delete <id>[/] delete chat    [bold {ACCENT}]/rename <id> <title>[/] rename chat
+[bold {ACCENT}]/memory[/] list facts    [bold {ACCENT}]/remember <fact>[/] save fact
+[bold {ACCENT}]/forget <id or text>[/] remove fact    [bold {ACCENT}]/memory clear[/] remove all facts
+[bold {ACCENT}]/auto on|off[/] auto-approve safe writes (deletes and overwrites always ask)
+[bold {ACCENT}]/tasks [id|all][/] executed actions    [bold {ACCENT}]/help[/] help    [bold {ACCENT}]exit[/] leave"""
 
 # ---------- big title ----------
 GLYPHS = {
@@ -85,9 +84,7 @@ def title_block(width):
 
 
 # ---------- buttons ----------
-BUTTONS = [("1", "Sessions"), ("2", "Tasks"), ("3", "Add documents"),
-           ("4", "Knowledge base"), ("5", "Toggle RAG"), ("6", "Help")]
-
+BUTTONS = [("1", "Chats"), ("2", "Tasks"), ("3", "Memory"), ("4", "Help")]
 
 def button_bar():
     t = Text()
@@ -98,26 +95,25 @@ def button_bar():
     return t
 
 
-def info_box(cfg, mode, backend, sid, rag, agent):
+def info_box(cfg, mode, backend, sid, agent):
     g = Table.grid(padding=(0, 2))
     g.add_column(style=DIM, justify="right")
     g.add_column()
-    g.add_row("Model", f"[bold {SOFT}]{escape(cfg.model)}[/]  [dim]chat[/]   [bold {SOFT}]{escape(cfg.embed_model)}[/]  [dim]embeddings[/]")
+    g.add_row("Model", f"[bold {SOFT}]{escape(cfg.model)}[/]  [dim]chat[/]")
     if mode == "sandbox":
         g.add_row("Environment", f"[bold {SOFT}]Docker sandbox[/]  [dim]isolated, no network, resource-limited[/]")
     else:
         g.add_row("Environment", f"[bold {SOFT}]Local machine[/]  [dim]{escape(backend.root)}[/]")
     g.add_row("Session", f"[bold {SOFT}]{sid}[/]")
-    g.add_row("Knowledge base", f"[bold {SOFT}]{len(rag.docs())}[/] documents  [dim]RAG {'on' if agent.rag_on else 'off'}[/]")
     g.add_row("Safety", "[dim]writes auto-approved, deletes ask[/]" if agent.auto else "[dim]every write and delete asks first[/]")
     return g
 
 
-def show_banner(cfg, mode, backend, sid, rag, agent):
+def show_banner(cfg, mode, backend, sid, agent):
     c.print()
     c.print(Panel(Group(title_block(max(20, c.size.width - 8)), Text(""),
-                        Align.center(Text("Local AI agent  ·  files  ·  documents  ·  RAG", style=DIM)),
-                        Text(""), Align.center(info_box(cfg, mode, backend, sid, rag, agent))),
+                        Align.center(Text("Local AI agent  ·  files  ·  memory", style=DIM)),
+                        Text(""), Align.center(info_box(cfg, mode, backend, sid, agent))),
                   box=box.ROUNDED, border_style=ACCENT, padding=(1, 3),
                   title=f"[bold {ACCENT}] MedTech [/]", subtitle=f"[{DIM}] v0.2 [/]"))
     c.print(Align.center(button_bar()))
@@ -136,10 +132,10 @@ def _table(title):
 # ---------- history views ----------
 def show_sessions(store):
     t = _table("Sessions")
-    for col in ("id", "mode", "started", "first message", "msgs", "tasks"):
+    for col in ("id", "mode", "updated", "title", "msgs", "tasks"):
         t.add_column(col)
     for s in store.sessions():
-        t.add_row(str(s["id"]), s["mode"], ts(s["started_at"]), escape(s["title"] or ""),
+        t.add_row(str(s["id"]), s["mode"], ts(s["updated_at"]), escape(s["title"] or "New chat"),
                   str(s["n_msgs"]), str(s["n_tasks"]))
     c.print(t)
 
@@ -172,10 +168,6 @@ class UI:
     def warn(self, text):
         c.print(f"[yellow]! {escape(text)}[/]")
 
-    def sources(self, hits):
-        c.print("[dim]sources: " + ", ".join(f"{h.source}" + (f" p.{h.page}" if h.page else "") +
-                                            f" ({h.score:.2f})" for h in hits) + "[/]")
-
     def action(self, tool, args, d):
         col = {"read": ACCENT, "write": "yellow", "danger": "red"}[d.risk]
         c.print(f"[dim {col}]> {tool} {escape(json.dumps(args, ensure_ascii=False)[:200])}  [{d.risk}][/]")
@@ -194,11 +186,14 @@ def build_parser():
     p.add_argument("--mode", choices=["sandbox", "local"], help="skip the question")
     p.add_argument("--workspace", default="~/medtech-workspace", help="folder the agent may touch in local mode")
     p.add_argument("--model", help="Ollama chat model")
-    p.add_argument("--resume", type=int, metavar="ID", help="continue a previous session")
+    resume = p.add_mutually_exclusive_group()
+    resume.add_argument("--resume", type=int, nargs="?", const=-1, metavar="ID", help="resume ID, or latest chat if omitted")
+    resume.add_argument("--continue", dest="continue_latest", action="store_true", help="resume latest chat")
+    p.add_argument("--debug", action="store_true", help="log tool arguments and raw results to stderr")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("sessions", help="list all sessions")
     h = sub.add_parser("history", help="show a session's chat")
-    h.add_argument("id", type=int)
+    h.add_argument("id", type=int, nargs="?", help="omit to list chats")
     t = sub.add_parser("tasks", help="show executed actions")
     t.add_argument("id", nargs="?", default="all")
     return p
@@ -225,168 +220,164 @@ def ask_mode():
         c.print("[yellow]type sandbox, local or exit[/]")
 
 
+def make_backend(mode: str, workspace: str = None):
+    """Open the recorded workspace without changing the user's filesystem location."""
+    if mode == "sandbox":
+        backend = SandboxBackend(workspace=workspace)
+        with c.status("starting sandbox ..."):
+            backend.ensure()
+        return backend
+    return LocalBackend(workspace or "~/medtech-workspace")
+
+
+def new_chat(agent: Agent, store: Store) -> None:
+    """Create a fresh conversation in the active execution environment."""
+    workspace = getattr(agent.backend, "host_root", agent.backend.root)
+    sid = store.new_session(agent.backend.name, workspace)
+    agent.resume(sid)
+    c.print(f"[dim]New chat {sid}[/]")
+
+
+def resume_chat(agent: Agent, store: Store, sid: int) -> None:
+    """Restore a conversation and its original backend before replacing active state."""
+    session = store.session(sid)
+    if session is None:
+        raise ValueError(f"no session {sid}")
+    backend = make_backend(session["mode"], session["workspace"])
+    agent.backend = backend
+    agent.resume(sid)
+    c.print(f"[dim]Resumed chat {sid} in {escape(backend.where())}[/]")
+
+
+def show_memories(store: Store) -> None:
+    """Display editable durable facts independently of conversation history."""
+    t = _table("Memory")
+    for col in ("id", "fact", "value"):
+        t.add_column(col)
+    for row in store.memories():
+        t.add_row(str(row["id"]), escape(row["key"]), escape(row["value"]))
+    c.print(t)
+
+
+def command(line: str, agent: Agent, store: Store) -> None:
+    """Handle a slash command; invalid arguments never terminate the chat."""
+    try:
+        parts = shlex.split(line)
+        if not parts:
+            return
+        cmd, args = parts[0].lower(), parts[1:]
+        arg = " ".join(args)
+        if cmd == "/help":
+            c.print(HELP)
+        elif cmd in ("/sessions", "/chats", "/history") and not args:
+            show_sessions(store)
+        elif cmd == "/history" and len(args) == 1:
+            show_history(store, int(args[0]))
+        elif cmd == "/new" and not args:
+            new_chat(agent, store)
+        elif cmd == "/resume" and len(args) == 1:
+            resume_chat(agent, store, int(args[0]))
+        elif cmd == "/delete" and len(args) == 1:
+            sid = int(args[0])
+            if not store.delete_session(sid):
+                raise ValueError(f"no session {sid}")
+            if agent.sid == sid:
+                new_chat(agent, store)
+            c.print(f"[dim]Deleted chat {sid}[/]")
+        elif cmd == "/rename" and len(args) >= 2:
+            sid = int(args[0])
+            if store.session(sid) is None:
+                raise ValueError(f"no session {sid}")
+            store.rename_session(sid, " ".join(args[1:]))
+            c.print(f"[dim]Renamed chat {sid}[/]")
+        elif cmd == "/memory" and not args:
+            show_memories(store)
+        elif cmd == "/memory" and arg == "clear":
+            store.clear_memories()
+            c.print("[dim]Memory cleared[/]")
+        elif cmd == "/remember" and arg:
+            store.remember(arg)
+            c.print("[dim]Remembered[/]")
+        elif cmd == "/forget" and arg:
+            count = store.forget_memory(arg)
+            c.print(f"[dim]Forgot {count} fact(s)[/]")
+        elif cmd == "/tasks":
+            show_tasks(store, None if arg == "all" else int(arg) if arg else agent.sid)
+        elif cmd == "/auto" and arg in ("on", "off"):
+            agent.auto = arg == "on"
+            c.print(f"auto-approve safe writes: {'on' if agent.auto else 'off'}")
+        else:
+            c.print("[yellow]unknown command or invalid arguments, try /help[/]")
+    except (ValueError, BackendError, OSError) as exc:
+        c.print(f"[red]{escape(str(exc))}[/]")
+
+
+def button(key: str, agent: Agent, store: Store) -> None:
+    """Map the terminal shortcut buttons to the same slash commands."""
+    command({"1": "/chats", "2": "/tasks", "3": "/memory", "4": "/help"}[key], agent, store)
+
+
 def _main(argv=None):
     a = build_parser().parse_args(argv)
     store = Store()
-    if a.cmd == "sessions":
-        return show_sessions(store)
-    if a.cmd == "history":
-        return show_history(store, a.id)
-    if a.cmd == "tasks":
-        return show_tasks(store, None if a.id == "all" else int(a.id))
-
-    if c.is_terminal:
-        draw_logo()  # animation first
-    cfg = Config()
-    if a.model:
-        cfg.model = a.model
-    hist, resumed = [], None
-    if a.resume:
-        resumed = store.session(a.resume)
-        if not resumed:
-            return c.print(f"[red]no session {a.resume}[/]")
-    mode = resumed["mode"] if resumed else (a.mode or ask_mode())
-    if mode is None:
-        return c.print("[dim]Goodbye.[/]")
-
     try:
-        if mode == "sandbox":
-            backend = SandboxBackend()
-            with c.status("starting sandbox ..."):
-                backend.ensure()
-        else:
-            backend = LocalBackend(a.workspace)
-    except BackendError as e:
-        return c.print(f"[red]{e}[/]")
-
-    if resumed:
-        sid = resumed["id"]
-        hist = [{"role": m["role"], "content": m["content"] if m["role"] == "user"
-                 else json.dumps({"say": m["content"], "action": None})} for m in store.messages(sid)]
-    else:
-        sid = store.new_session(mode, backend.root)
-
-    rag = RAG(store, make_embedder(cfg))
-    ui = UI()
-    agent = Agent(cfg, backend, store, sid, rag, ui, auto=(mode == "sandbox"), hist=hist)
-    threading.Thread(target=lambda: _warm(cfg), daemon=True).start()
-    show_banner(cfg, mode, backend, sid, rag, agent)
-
-    while True:
-        try:
-            q = Prompt.ask(f"[bold {ACCENT}]{mode}[/] [dim]{escape(backend.where())}[/] [bold {ACCENT}]>[/]").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not q:
-            continue
-        if q.lower() in ("exit", "quit", "/exit"):
-            break
-        if q.lower() in ("m", "/menu"):
-            c.print(Align.center(button_bar()))
-            continue
-        if q in dict(BUTTONS):
+        if a.cmd == "sessions":
+            return show_sessions(store)
+        if a.cmd == "history":
+            return show_history(store, a.id) if a.id is not None else show_sessions(store)
+        if a.cmd == "tasks":
+            return show_tasks(store, None if a.id == "all" else int(a.id))
+        if c.is_terminal:
+            draw_logo()
+        cfg = Config()
+        if a.model:
+            cfg.model = a.model
+        resumed = None
+        if a.resume is not None or a.continue_latest:
+            resumed = store.latest_session() if a.resume in (None, -1) else store.session(a.resume)
+            if resumed is None:
+                return c.print("[red]No matching chat to resume.[/]")
+        mode = resumed["mode"] if resumed else (a.mode or ask_mode())
+        if mode is None:
+            return c.print("[dim]Goodbye.[/]")
+        workspace = resumed["workspace"] if resumed else a.workspace if mode == "local" else None
+        backend = make_backend(mode, workspace)
+        sid = resumed["id"] if resumed else store.new_session(mode, getattr(backend, "host_root", backend.root))
+        agent = Agent(cfg, backend, store, sid, UI(), auto=(mode == "sandbox"), debug=a.debug)
+        show_banner(cfg, mode, backend, sid, agent)
+        while True:
             try:
-                button(q, agent, store, rag)
-            except KeyboardInterrupt:
-                c.print("[yellow]cancelled[/]")
-            continue
-        if q.startswith("/"):
+                q = Prompt.ask(f"[bold {ACCENT}]{agent.backend.name}[/] [dim]{escape(agent.backend.where())}[/] [bold {ACCENT}]>[/]").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not q:
+                continue
+            if q.lower() in ("exit", "quit", "/exit"):
+                break
+            if q.lower() in ("m", "/menu"):
+                c.print(Align.center(button_bar()))
+                continue
             try:
-                command(q, agent, store, rag, backend)
+                if q in dict(BUTTONS):
+                    button(q, agent, store)
+                elif q.startswith("/"):
+                    command(q, agent, store)
+                else:
+                    agent.turn(q)
+            except LLMError as exc:
+                c.print(f"[red]LLM error: {escape(str(exc))}[/]")
             except KeyboardInterrupt:
-                c.print("[yellow]cancelled[/]")
-            continue
-        try:
-            agent.turn(q)
-        except LLMError as e:
-            c.print(f"[red]LLM error: {escape(str(e))}[/]")
-            agent.hist.pop()
-        except KeyboardInterrupt:
-            c.print("[yellow]interrupted[/]")
-    c.print(f"[dim]Goodbye. Session {sid} saved  ·  `medtech history {sid}`[/]")
+                c.print("[yellow]interrupted; messages already saved[/]")
+        c.print(f"[dim]Goodbye. Session {agent.sid} saved  ·  `medtech history {agent.sid}`[/]")
+    finally:
+        store.close()
 
 
 def main(argv=None):
     try:
         _main(argv)
+    except (StoreError, BackendError, OSError, ValueError) as exc:
+        c.print(f"[red]Error: {escape(str(exc))}[/]")
+        return 1
     except (KeyboardInterrupt, EOFError):
         c.print("\n[dim]Goodbye.[/]")
-
-
-def _warm(cfg):
-    try:
-        chat(cfg, [{"role": "user", "content": 'reply {"say":"hi","action":null}'}])
-    except Exception:  # noqa: BLE001 - warm-up is best effort
-        pass
-
-
-def ingest(rag, path):
-    path = path.strip().strip('"\'')
-    try:
-        with c.status("embedding documents ..."):
-            res = rag.ingest(path)
-        for name, status in res:
-            c.print(f"[{ACCENT}]+[/] {escape(name)}  [dim]{status}[/]")
-        if not res:
-            c.print("[yellow]nothing to ingest (supported: pdf, txt, md, csv, json, log, py)[/]")
-    except Exception as e:  # noqa: BLE001
-        c.print(f"[red]ingest failed: {escape(str(e))}[/]  [dim](embedding model: `ollama pull nomic-embed-text`)[/]")
-
-
-def show_docs(rag):
-    t = _table("Knowledge base")
-    for col in ("id", "name", "chunks", "path"):
-        t.add_column(col)
-    for d in rag.docs():
-        t.add_row(str(d["id"]), d["name"], str(d["n"]), escape(d["path"]))
-    c.print(t)
-
-
-def button(key, agent, store, rag):
-    if key == "1":
-        show_sessions(store)
-    elif key == "2":
-        show_tasks(store, agent.sid)
-    elif key == "3":
-        p = Prompt.ask("Path to a PDF, file or folder (empty to cancel)", default="")
-        if p.strip():
-            ingest(rag, p)
-    elif key == "4":
-        show_docs(rag)
-    elif key == "5":
-        agent.rag_on = not agent.rag_on
-        c.print(f"RAG: {'on' if agent.rag_on else 'off'}")
-    elif key == "6":
-        c.print(HELP)
-
-
-def command(line, agent, store, rag, backend):
-    try:
-        parts = shlex.split(line, posix=False)
-    except ValueError:
-        parts = line.split()
-    cmd, args = parts[0].lower(), [x.strip('"\'') for x in parts[1:]]
-    arg = " ".join(args)
-    if cmd == "/help":
-        c.print(HELP)
-    elif cmd == "/sessions":
-        show_sessions(store)
-    elif cmd == "/history":
-        show_history(store, int(arg) if arg.isdigit() else agent.sid)
-    elif cmd == "/tasks":
-        show_tasks(store, None if arg == "all" else int(arg) if arg.isdigit() else agent.sid)
-    elif cmd == "/auto":
-        agent.auto = arg == "on"
-        c.print(f"auto-approve safe writes: {'on' if agent.auto else 'off'}")
-    elif cmd == "/rag":
-        agent.rag_on = arg != "off"
-        c.print(f"RAG: {'on' if agent.rag_on else 'off'}")
-    elif cmd == "/docs":
-        show_docs(rag)
-    elif cmd == "/forget" and arg.isdigit():
-        rag.forget(int(arg))
-        c.print("removed")
-    elif cmd == "/ingest" and arg:
-        ingest(rag, arg)
-    else:
-        c.print("[yellow]unknown command, try /help[/]")
