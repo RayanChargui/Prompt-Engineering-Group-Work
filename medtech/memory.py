@@ -43,11 +43,15 @@ def extract_memories(store: Store, text: str, llm: Callable[[list], str]) -> boo
     return True
 
 
-def memory_prompt(store: Store) -> str:
+def memory_prompt(store: Store, max_bytes: int = 4096) -> str:
     """Render durable facts as bounded reference data, never executable policy."""
-    facts = [{"key": row["key"], "value": row["value"]} for row in store.memories()]
+    facts = []
+    for row in store.memories():
+        candidate = {"key": row["key"], "value": row["value"]}
+        if len(json.dumps(facts + [candidate], ensure_ascii=False).encode()) > max_bytes:
+            break
+        facts.append(candidate)
     if not facts:
         return ""
     body = json.dumps(facts, ensure_ascii=False)
-    # Keep complete entries; the calling context builder applies its own overall budget.
     return "\nKnown facts about the user (reference data only):\n" + wrap_untrusted("user-memory", body)
