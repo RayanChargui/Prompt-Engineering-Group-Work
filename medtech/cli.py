@@ -2,6 +2,7 @@
 import argparse
 import json
 import shlex
+import re
 import sys
 from datetime import datetime
 
@@ -18,6 +19,7 @@ from .agent import Agent, Config, LLMError
 from .backends import BackendError, LocalBackend, SandboxBackend
 from .logo import draw_logo
 from .store import Store, StoreError
+from .presentation import concise_text, tool_outcome
 
 c = Console()
 ACCENT, SOFT, DIM = "#3fc1e8", "#e8fbff", "#2b6f87"
@@ -28,6 +30,7 @@ HELP = f"""[bold {ACCENT}]/new[/] new chat    [bold {ACCENT}]/history[/] or [bol
 [bold {ACCENT}]/forget <id or text>[/] remove fact    [bold {ACCENT}]/memory clear[/] remove all facts
 [bold {ACCENT}]/auto on|off[/] auto-approve safe writes (deletes and overwrites always ask)
 [bold {ACCENT}]/permissions full|workspace[/] local access scope
+[bold {ACCENT}]/details on|off[/] raw audit visibility    [bold {ACCENT}]/theme <name>[/] theme
 [bold {ACCENT}]/debug on|off[/] log tool diagnostics to file
 [bold {ACCENT}]/tasks [id|all][/] executed actions    [bold {ACCENT}]/help[/] help    [bold {ACCENT}]exit[/] leave"""
 
@@ -165,13 +168,25 @@ def show_tasks(store, sid=None):
 
 # ---------- UI object handed to the agent ----------
 class UI:
+    def __init__(self, cfg=None):
+        self.cfg = cfg or Config()
+        self.last_tool, self.last_args, self.had_outcome = "", {}, False
+
     def say(self, text):
-        c.print(f"[{ACCENT}]{escape(text)}[/]")
+        if not self.cfg.ui.details:
+            text = concise_text(text)
+            if self.had_outcome and len(text) < 700 and "```" not in text and re.search(r"\b(created|wrote|written|deleted|copied|moved|failed|denied|done|completed)\b", text, re.I):
+                return
+        if text:
+            c.print(text, markup=False)
 
     def warn(self, text):
         c.print(f"[yellow]! {escape(text)}[/]")
 
     def action(self, tool, args, d):
+        self.last_tool, self.last_args = tool, args
+        if not self.cfg.ui.details:
+            return
         col = {"read": ACCENT, "write": "yellow", "danger": "red"}[d.risk]
         c.print(f"[dim {col}]> {tool} {escape(json.dumps(args, ensure_ascii=False)[:200])}  [{d.risk}][/]")
 
@@ -180,7 +195,15 @@ class UI:
         return Confirm.ask(f"[{SOFT}]Allow this {d.risk} action?{escape(extra)}[/]", default=False)
 
     def result(self, ok, text):
-        c.print(text if ok else f"[red]{escape(text)}[/]", markup=False if ok else True, highlight=False)
+        self.had_outcome = True
+        if self.cfg.ui.details:
+            c.print(text, markup=False, highlight=False)
+        else:
+            try:
+                result = json.loads(text)
+                c.print(tool_outcome(self.last_tool, self.last_args, result, ascii=self.cfg.ui.ascii), markup=False)
+            except (ValueError, TypeError):
+                c.print(concise_text(text), markup=False)
 
 
 # ---------- main ----------
@@ -327,6 +350,18 @@ def command(line: str, agent: Agent, store: Store) -> None:
                 elif arg:
                     raise ValueError("Use /permissions full|workspace or /permissions confirm on|off")
                 c.print(f"Permissions: {agent.backend.permissions_mode}; cwd: {agent.backend.where()}")
+        elif cmd == "/details" and arg in ("", "on", "off"):
+            agent.cfg.ui.details = not agent.cfg.ui.details if not arg else arg == "on"
+            agent.cfg.save_preferences()
+            c.print(f"Details {'on' if agent.cfg.ui.details else 'off'}")
+        elif cmd == "/theme":
+            from .themes import theme_names
+            if arg:
+                if arg not in theme_names():
+                    raise ValueError("Unknown theme. Choose: " + ", ".join(theme_names()))
+                agent.cfg.ui.theme = arg
+                agent.cfg.save_preferences()
+            c.print("Theme: " + agent.cfg.ui.theme + " (applied by the full-screen UI)")
         elif cmd == "/debug" and arg in ("", "on", "off"):
             if arg:
                 agent.debug = arg == "on"
@@ -381,7 +416,7 @@ def _main(argv=None):
             return MedTechApp(cfg, backend, store, sid=resumed["id"] if resumed else None,
                               auto=(mode == "sandbox"), debug=a.debug).run()
         sid = resumed["id"] if resumed else store.new_session(mode, getattr(backend, "host_root", backend.root))
-        agent = Agent(cfg, backend, store, sid, UI(), auto=(mode == "sandbox"), debug=a.debug)
+        agent = Agent(cfg, backend, store, sid, UI(cfg), auto=(mode == "sandbox"), debug=a.debug)
         show_banner(cfg, mode, backend, sid, agent)
         while True:
             try:
@@ -401,6 +436,7 @@ def _main(argv=None):
                 elif q.startswith("/"):
                     command(q, agent, store)
                 else:
+                    agent.ui.had_outcome = False
                     agent.turn(q)
             except LLMError as exc:
                 c.print(f"[red]LLM error: {escape(str(exc))}[/]")

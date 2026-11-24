@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import threading
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -14,7 +15,7 @@ from typing import Callable, Protocol, Optional
 from . import policy
 from .memory import extract_memories, memory_prompt
 from .ollama import native_context, normalized_response, tagged_response, tool_definitions
-from .store import home
+from .store import home, StoreError
 from .settings import PermissionsConfig, UIConfig, SandboxConfig, Settings, load_settings, save_settings
 
 MAX_STEPS = 12
@@ -182,9 +183,12 @@ def _post_stream(url: str, body: dict, timeout: float, on_delta=None, cancel_eve
 def chat(cfg: Config, messages: list, *, memory: bool = False, on_delta=None, cancel_event=None) -> str:
     """Use native Ollama functions for actions and isolated JSON extraction for facts."""
     _check_cancel(cancel_event)
+    generation_budget = cfg.num_predict
+    if not memory and not cfg.ui.details:
+        generation_budget = min(generation_budget, 768)
     body = {"model": cfg.model, "messages": messages, "stream": on_delta is not None and not memory,
             "keep_alive": "30m", "options": {"temperature": 0, "num_ctx": cfg.num_ctx,
-                                               "num_predict": min(cfg.num_predict, 400) if memory else cfg.num_predict}}
+                                               "num_predict": min(cfg.num_predict, 400) if memory else generation_budget}}
     if memory:
         body["format"] = "json"
     else:
@@ -231,6 +235,9 @@ def parse(raw: str) -> dict:
 
 SYSTEM = """You are MedTech, a local assistant managing files in the active execution environment.
 Use the provided native function tools for actions. Return normal assistant text when finished.
+Be terse: result first, at most a few sentences unless the user requested substantial output.
+Never narrate reasoning, plans, intermediate steps, or "let me" chatter. No preambles,
+recaps, or offers of further help. On failure report the actual cause plainly.
 For compatibility, a single JSON object {{"say":"short answer","action":null or {{"tool":"name","args":{{...}}}}}} is also accepted.
 Tools:
 - pwd {{}} | ls {{path?}} | cd {{path}} | read_file {{path}}
@@ -480,8 +487,14 @@ class Agent:
         try:
             _check_cancel(self.cancel_event)
             self._turn(user_text)
-        except BaseException:
-            self._notify("discard_draft")
+        except BaseException as exc:
+            try:
+                if isinstance(exc, Exception) and not isinstance(exc, (InterruptedError, TurnCancelled)):
+                    self._record("diagnostic", traceback.format_exc(), {"internal": True, "error": True})
+            except (StoreError, OSError):
+                pass  # Retain the original exception when its diagnostic cannot be saved.
+            finally:
+                self._notify("discard_draft")
             raise
 
     def _turn(self, user_text: str) -> None:
