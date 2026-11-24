@@ -113,3 +113,21 @@ def test_corrupt_database_has_friendly_error(tmp_path, monkeypatch):
     assert cli.main(["sessions"]) == 1
     assert "Error:" in output.getvalue()
     assert "Traceback" not in output.getvalue()
+
+
+def test_unreachable_ollama_keeps_user_input_without_traceback(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEDTECH_HOME", str(tmp_path / "state"))
+    # Bind an ephemeral local port without listening, guaranteeing connection refusal.
+    import socket
+    with socket.socket() as blocked:
+        blocked.bind(("127.0.0.1", 0))
+        monkeypatch.setenv("OLLAMA_URL", f"http://127.0.0.1:{blocked.getsockname()[1]}")
+        result = subprocess.run([sys.executable, "-m", "medtech", "--mode", "local",
+                                 "--workspace", str(tmp_path / "files")], input="Keep this message\nexit\n",
+                                capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0
+    assert "Cannot reach Ollama" in result.stdout
+    assert "Traceback" not in result.stdout + result.stderr
+    store = Store()
+    assert store.messages(store.latest_session()["id"])[0]["content"] == "Keep this message"
+    store.close()

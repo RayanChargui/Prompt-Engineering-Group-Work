@@ -339,14 +339,14 @@ class Agent:
             self._record("tool", encoded, {"tool": tool, "args": args})
             self.ui.result(result["success"], encoded)
             if result["success"]:
-                # Later delete/move/overwrite operations invalidate earlier path evidence.
-                changed = args.get("src") if tool == "move" else args.get("path") if tool in {"delete", "write_file"} else None
-                if changed:
-                    changed = os.path.normpath(os.path.join(result["cwd"], changed))
+                # Use resolved tool evidence, including symlinks, rather than proposed paths.
+                for changed in result.get("verified", []):
+                    path = changed.get("path", "")
                     for _, previous in successes:
                         previous["verified"] = [item for item in previous.get("verified", [])
-                                                if item.get("path") != changed and
-                                                not item.get("path", "").startswith(changed + "/")]
+                                                if item.get("path") != path and
+                                                (changed.get("exists") or
+                                                 not item.get("path", "").startswith(path + "/"))]
                 successes.append((tool, json.loads(encoded)))
             if tool in policy.TAINTING:
                 tainted = True
