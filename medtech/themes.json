@@ -1,0 +1,68 @@
+{
+  "neutral": {
+    "primary": "#86a9c4",
+    "secondary": "#a3a9bd",
+    "accent": "#a9c4d7",
+    "foreground": "#e7e9ee",
+    "background": "#14161b",
+    "surface": "#1c1f26",
+    "panel": "#22262e",
+    "success": "#80c29c",
+    "warning": "#dbbd83",
+    "error": "#e49398",
+    "dark": true,
+    "variables": {
+      "medtech-border": "#343a46",
+      "medtech-muted": "#a4aaba",
+      "medtech-hover": "#292e38",
+      "medtech-selected": "#303b49",
+      "medtech-user": "#252e3a",
+      "medtech-assistant": "#1c1f26",
+      "medtech-code": "#15181e"
+    }
+  },
+  "colorful": {
+    "primary": "#b4a0ed",
+    "secondary": "#73bfd1",
+    "accent": "#a4d9db",
+    "foreground": "#eeeaf7",
+    "background": "#161522",
+    "surface": "#201e31",
+    "panel": "#2a263e",
+    "success": "#85d4ae",
+    "warning": "#ecc48e",
+    "error": "#f19aad",
+    "dark": true,
+    "variables": {
+      "medtech-border": "#443c60",
+      "medtech-muted": "#b2a9c8",
+      "medtech-hover": "#302a48",
+      "medtech-selected": "#42375d",
+      "medtech-user": "#302943",
+      "medtech-assistant": "#211f32",
+      "medtech-code": "#181622"
+    }
+  },
+  "light": {
+    "primary": "#355f87",
+    "secondary": "#665884",
+    "accent": "#326879",
+    "foreground": "#242b36",
+    "background": "#f4f5f7",
+    "surface": "#ffffff",
+    "panel": "#e9edf2",
+    "success": "#287346",
+    "warning": "#8a621e",
+    "error": "#ac344b",
+    "dark": false,
+    "variables": {
+      "medtech-border": "#c4cbd5",
+      "medtech-muted": "#626c7c",
+      "medtech-hover": "#e3e9f0",
+      "medtech-selected": "#d6e2ee",
+      "medtech-user": "#e1eaf4",
+      "medtech-assistant": "#ffffff",
+      "medtech-code": "#edf0f4"
+    }
+  }
+}

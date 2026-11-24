@@ -1,30 +1,59 @@
 """Responsive Textual chat UI over the independently testable agent core."""
 import asyncio
 import json
+import re
+import traceback
 import shlex
 import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
+from rich.segment import Segment
+from rich.style import Style
+from rich.text import Text
+from textual.strip import Strip
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
-from textual.widgets import Button, Collapsible, Footer, Input, Label, ListItem, ListView, Markdown, Static, TextArea
+from textual.widgets import Button, Collapsible, Footer, Input, Label, ListItem, ListView, LoadingIndicator, Markdown, Static, Switch, TextArea
 
 from .agent import Agent, Config, LLMError, chat
 from .backends import LocalBackend, SandboxBackend
 from .memory import extract_memories
+from .presentation import brief_error, concise_text, tool_outcome
+from .themes import apply_theme, theme_names
 from .store import Store, StoreError
-from .tui_dialogs import ChatMenuDialog, ConfirmToolDialog, DeleteDialog, MemoryDialog, RenameDialog
+from .tui_dialogs import ChatMenuDialog, ConfirmToolDialog, DeleteDialog, MemoryDialog, RenameDialog, ThemeDialog
+
+
+class MessageInput(TextArea):
+    """Show an empty-editor hint without putting placeholder text in user input."""
+    def render_line(self, y: int) -> Strip:
+        if not self.text and y == 0:
+            hint = "Message MedTech...  Ctrl+Enter to send" if self.app.cfg.ui.ascii else "Message MedTech…  Ctrl+Enter to send"
+            return Strip([Segment(hint, self.rich_style + Style(dim=True))]).adjust_cell_length(self.scrollable_content_region.width)
+        return super().render_line(y)
 
 
 class ChatItem(ListItem):
     """A sidebar entry carrying a persistent session id."""
-    def __init__(self, sid: int, title: str, current: bool = False):
-        self.sid = sid
-        super().__init__(Static(title, markup=False), id=f"chat-{sid}", classes="current" if current else "")
+    def __init__(self, sid: int, title: str, current: bool = False, ascii_only: bool = False):
+        self.sid, self.full_title, self.ascii_only = sid, title, ascii_only
+        super().__init__(Static(Text(title, no_wrap=True, overflow="ellipsis")),
+                         id=f"chat-{sid}", classes="current" if current else "")
+        self.tooltip = title
+
+    def on_resize(self, event: events.Resize) -> None:
+        width = max(1, event.size.width - 3)
+        title = Text(self.full_title, no_wrap=True)
+        if self.ascii_only and title.cell_len > width:
+            title.truncate(max(0, width - 3), overflow="crop")
+            title.append("." * min(3, width))
+        else:
+            title.truncate(width, overflow="ellipsis")
+        self.query_one(Static).update(title)
 
     def on_mouse_down(self, event: events.MouseDown) -> None:
         if event.button == 3:
@@ -61,7 +90,7 @@ class WorkerUI:
     message_saved = saved
 
     def warn(self, text: str) -> None:
-        self.dispatch(self.app.show_notice, text)
+        self.dispatch(self.app.show_warning, text)
 
     def action(self, tool: str, args: dict, decision: object) -> None:
         self.dispatch(self.app.set_status, f"Running {tool}…")
@@ -98,37 +127,10 @@ class WorkerUI:
 class MedTechApp(App):
     """Persistent sidebar, full transcript, and threaded local-agent turns."""
     TITLE = "MedTech"
-    CSS = """
-    Screen { layout: vertical; background: #10151b; color: #e5edf4; }
-    #body { height: 1fr; }
-    #sidebar { width: 30; background: #171f28; border-right: solid #2c3948; padding: 1; }
-    #sidebar.hidden { display: none; }
-    #brand { text-style: bold; color: #65d4ec; margin-bottom: 1; }
-    #new-chat, #memory { width: 100%; margin-bottom: 1; }
-    #chat-search { margin-bottom: 1; }
-    #chat-list { height: 1fr; background: transparent; }
-    #chat-list ListItem { padding: 0 1; height: 2; }
-    #chat-list ListItem.current { background: #254452; border-left: thick #65d4ec; }
-    #chat-list .date-group { height: 2; color: #9aaabd; text-style: bold; padding-top: 1; }
-    #sidebar-footer { height: auto; color: #9aaabd; border-top: solid #2c3948; padding-top: 1; }
-    #main { width: 1fr; min-width: 20; }
-    #chat-title { height: 3; padding: 1 2; border-bottom: solid #2c3948; text-style: bold; }
-    #transcript { height: 1fr; padding: 1 2; }
-    .bubble { height: auto; padding: 1 2; margin-bottom: 1; }
-    .user { background: #1b3542; margin-left: 5; }
-    .assistant { background: #19222c; margin-right: 3; }
-    .speaker { text-style: bold; color: #65d4ec; height: 1; }
-    .notice { color: #d5b47b; height: auto; padding: 0 1; margin-bottom: 1; }
-    #draft { border-left: thick #ceac6b; }
-    .draft-label { color: #ceac6b; height: 1; }
-    Collapsible { margin-bottom: 1; background: #151d26; }
-    #composer { height: auto; max-height: 12; padding: 1 2 0 2; border-top: solid #2c3948; }
-    #message-input { height: 5; min-height: 3; width: 1fr; border: round #42596c; }
-    #send { width: 10; min-width: 8; margin-left: 1; height: 3; }
-    #status { height: 2; padding: 0 2; color: #9aaabd; }
-    Footer { background: #171f28; }
-    """
+    CSS_PATH = 'styles.tcss'
     BINDINGS = [
+        Binding("ctrl+d", "toggle_details", "Details", priority=True),
+        Binding("ctrl+t", "theme", "Theme", priority=True),
         Binding("ctrl+n", "new_chat", "New chat", priority=True),
         Binding("ctrl+b", "toggle_sidebar", "Sidebar", priority=True),
         Binding("ctrl+f", "search", "Find chat", priority=True),
@@ -144,7 +146,13 @@ class MedTechApp(App):
                  auto: bool = False, llm=None, debug: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.cfg, self.backend, self.store = cfg, backend, store
+        self.cfg.ui.theme = apply_theme(self, self.cfg.ui.theme)
         self.sid, self.auto, self.llm, self.debug_enabled = sid, auto, llm, debug
+        self.details = bool(cfg.ui.details)
+        self._status_text = "Ready"
+        self._turn_outcome = False
+        self._last_tool = ("", {})
+        self._turn_traceback = ""
         self.busy = False
         self.cancel_event = threading.Event()
         self.shutdown_event = threading.Event()
@@ -168,22 +176,29 @@ class MedTechApp(App):
     def compose(self) -> ComposeResult:
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
-                yield Static("◈  MEDTECH", id="brand")
-                yield Button("＋ New chat", id="new-chat", variant="primary")
-                yield Input(placeholder="Search conversations…", id="chat-search")
+                yield Static("MEDTECH" if self.cfg.ui.ascii else "◈  MEDTECH", id="brand")
+                yield Button("+ New chat" if self.cfg.ui.ascii else "＋ New chat", id="new-chat", variant="primary")
+                yield Input(placeholder="Search conversations..." if self.cfg.ui.ascii else "Search conversations…", id="chat-search")
                 yield ListView(id="chat-list")
                 yield Button("Memory", id="memory")
+                yield Button("Themes", id="themes")
                 yield Static("", id="sidebar-footer", markup=False)
             with Vertical(id="main"):
                 yield Static("New chat", id="chat-title", markup=False)
                 yield VerticalScroll(id="transcript")
                 with Horizontal(id="composer"):
-                    yield TextArea(id="message-input", soft_wrap=True)
+                    yield MessageInput(id="message-input", soft_wrap=True)
                     yield Button("Send", id="send", variant="primary")
-                yield Static("Ready · Ctrl+Enter to send · Enter inserts a new line", id="status", markup=False)
+                with Horizontal(id="status-area"):
+                    yield LoadingIndicator(id="thinking")
+                    yield Static("Ready", id="status", markup=False)
+                    yield Label("Details", id="details-label")
+                    yield Switch(value=self.details, id="details-switch", animate=False)
+                yield Static("", id="context-bar", markup=False)
         yield Footer()
 
     async def on_mount(self) -> None:
+        self.chat_widget("#thinking", LoadingIndicator).display = False
         await self.refresh_history()
         await self.render_transcript()
         self.update_footer()
@@ -195,16 +210,108 @@ class MedTechApp(App):
             self._apply_responsive(event.size.width)
 
     def _apply_responsive(self, width: int) -> None:
+        self.screen_stack[0].set_class(width < 80, "narrow")
         if self._last_width is None or (width < 80) != (self._last_width < 80):
             self.chat_widget("#sidebar").set_class(width < 80 or self._sidebar_user_hidden, "hidden")
         self._last_width = width
 
+    def chrome(self, text: str) -> str:
+        """Use portable punctuation for interface labels in ASCII mode."""
+        if self.cfg.ui.ascii:
+            for old, new in (("…", "..."), ("·", "|"), ("—", "-"), ("◈", "*"), ("＋", "+")):
+                text = text.replace(old, new)
+        return text
+
     def update_footer(self) -> None:
-        mode = "Docker sandbox" if self.backend.name == "sandbox" else "Local"
-        self.chat_widget("#sidebar-footer", Static).update(f"{self.cfg.model}\n{mode}")
+        mode = "Docker" if self.backend.name == "sandbox" else "Local"
+        permission = self.cfg.permissions.mode if self.backend.name == "local" else "workspace"
+        detail = "Details on" if self.details else "Details off"
+        cwd = self.backend.where()
+        self.chat_widget("#sidebar-footer", Static).update(self.chrome(f"{self.cfg.model}\n{mode} · {permission}\n{cwd}\n{detail}"))
+        context = self.chat_widget("#context-bar", Static)
+        context.update(Text(f"{self.cfg.model} | {mode} | {permission} | {detail}\n{cwd}", no_wrap=True, overflow="ellipsis"))
+        context.tooltip = cwd
 
     def set_status(self, text: str) -> None:
-        self.chat_widget("#status", Static).update(text)
+        self._status_text = text
+        self.chat_widget("#status", Static).update(self.chrome(text.splitlines()[0][:160]))
+        self.chat_widget("#thinking", LoadingIndicator).display = self.busy
+        self.update_footer()
+
+    def save_preferences(self) -> None:
+        """Persist only explicit UI/settings changes, with an actionable error."""
+        try:
+            self.cfg.save_preferences()
+        except (OSError, ValueError) as exc:
+            self.set_status(f"Could not save preferences: {exc}")
+
+    async def set_details(self, value: bool) -> None:
+        if value == self.details:
+            return
+        self.details = value
+        self.cfg.ui.details = value
+        self.chat_widget("#details-switch", Switch).value = value
+        self.save_preferences()
+        await self.render_transcript()
+        if self._turn_error:
+            await self.show_error(self._turn_error, self._turn_traceback)
+        self.set_status("Details on" if value else "Details off · Ctrl+D for diagnostics")
+
+    @on(Switch.Changed, "#details-switch")
+    async def details_changed(self, event: Switch.Changed) -> None:
+        await self.set_details(event.value)
+
+    async def action_toggle_details(self) -> None:
+        await self.set_details(not self.details)
+
+    def action_theme(self) -> None:
+        async def selected(value) -> None:
+            if value:
+                name, ascii_mode = value
+                self.cfg.ui.theme = apply_theme(self, name)
+                self.cfg.ui.ascii = ascii_mode
+                self.chat_widget("#brand", Static).update("MEDTECH" if ascii_mode else "◈  MEDTECH")
+                self.chat_widget("#new-chat", Button).label = "+ New chat" if ascii_mode else "＋ New chat"
+                self.chat_widget("#chat-search", Input).placeholder = "Search conversations..." if ascii_mode else "Search conversations…"
+                self.save_preferences()
+                await self.render_transcript()
+                self.set_status("Theme saved: " + self.cfg.ui.theme)
+        self.push_screen(ThemeDialog(theme_names(), self.cfg.ui.theme, self.cfg.ui.ascii), selected)
+
+    @on(Button.Pressed, "#themes")
+    def theme_pressed(self) -> None:
+        self.action_theme()
+
+    @staticmethod
+    def redundant_final(text: str, had_outcome: bool) -> bool:
+        """Hide pure tool-summary repetition while retaining mixed answers/code."""
+        if not had_outcome or len(text) > 700 or "```" in text:
+            return False
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n", text) if part.strip()]
+        action = re.compile(r"\b(creat(?:e|ed|ing)|made|mkdir|writ(?:e|ten|ing)|wrote|sav(?:e|ed)|cop(?:y|ied)|"
+                            r"mov(?:e|ed)|delet(?:e|ed)|remov(?:e|ed)|failed|denied|permission|successful|done|completed)\b", re.I)
+        summary = re.compile(r"(?:[/\\]|\b(?:file|folder|directory|path|permission)\b|^\s*(?:I\b|we\b|created\b|wrote\b|saved\b|copied\b|moved\b|deleted\b|done\b|completed\b|couldn.t\b|could not\b|failed\b))", re.I)
+        return bool(sentences) and all(action.search(part) and summary.search(part) for part in sentences)
+
+    async def add_outcome(self, tool: str, args: dict, result: dict) -> bool:
+        text = tool_outcome(tool, args, result, ascii=self.cfg.ui.ascii)
+        if text:
+            await self.chat_widget("#transcript", VerticalScroll).mount(Static(text, markup=False, classes="outcome " + ("success" if result.get("success") else "failure")))
+            self.chat_widget("#transcript", VerticalScroll).scroll_end(animate=False)
+        return bool(text) and (tool in {"mkdir", "write_file", "move", "copy", "delete"} or not result.get("success"))
+
+    async def show_error(self, error: str, trace: str = "") -> None:
+        if self.details and trace:
+            await self.chat_widget("#transcript", VerticalScroll).mount(Collapsible(Static(trace, markup=False), title="Exception details", collapsed=False))
+        marker = "FAIL" if self.cfg.ui.ascii else "✗"
+        cause = brief_error(error)
+        await self.show_notice(f"{marker} {cause}" + ("" if self.details else " (Ctrl+D for details)"))
+
+    async def show_warning(self, text: str) -> None:
+        if self.details:
+            await self.show_notice(text)
+        else:
+            self.set_status(text.splitlines()[0][:100] + " · Ctrl+D for details")
 
     def available(self) -> bool:
         if self.busy:
@@ -237,7 +344,7 @@ class MedTechApp(App):
                     continue
                 await listing.append(ListItem(Label(group), disabled=True, classes="date-group"))
                 for row in groups[group]:
-                    await listing.append(ChatItem(row["id"], row["title"] or "Untitled", row["id"] == self.sid))
+                    await listing.append(ChatItem(row["id"], row["title"] or "Untitled", row["id"] == self.sid, self.cfg.ui.ascii))
                     if row["id"] == self.sid:
                         selected = len(listing.children) - 1
             if selected is not None:
@@ -255,6 +362,8 @@ class MedTechApp(App):
         bubble = Vertical(Static("You" if role == "user" else "MedTech", classes="speaker"),
                           Markdown(text), classes=f"bubble {role}")
         transcript = self.chat_widget("#transcript", VerticalScroll)
+        for welcome in transcript.query("#welcome"):
+            await welcome.remove()
         await transcript.mount(bubble)
         transcript.scroll_end(animate=False)
 
@@ -267,8 +376,16 @@ class MedTechApp(App):
         await transcript.remove_children()
         self._draft_widget, self._draft_text = None, ""
         if self.sid is None:
-            await self.show_notice("Start a conversation. Your chats and memories stay on this machine.")
+            await transcript.mount(Vertical(
+                Static("Your local assistant", id="welcome-title", markup=False),
+                Static("Ask for a result. Tools verify the work.", classes="welcome-muted", markup=False),
+                Static("Try a short request", classes="welcome-section", markup=False),
+                Static("Create a folder called test in the current directory.\nRead a text file and explain what it contains.\nRemember that I prefer concise answers.", id="welcome-prompts", markup=False),
+                Static("Ctrl+Enter  Send     Ctrl+N  New chat\nCtrl+D  Details     Ctrl+T  Theme", classes="welcome-muted", markup=False),
+                id="welcome"))
+            self.set_status("Ready")
             return
+        had_outcome = False
         for row in self.store.messages(self.sid):
             role, content = row["role"], row["content"]
             try:
@@ -276,27 +393,43 @@ class MedTechApp(App):
             except (ValueError, TypeError):
                 metadata = {}
             if role == "tool":
-                await transcript.mount(Collapsible(Static(content, markup=False), title="Tool result", collapsed=True))
+                if self.details:
+                    await transcript.mount(Collapsible(Static(content, markup=False), title="Tool result", collapsed=True))
+                else:
+                    try:
+                        result = json.loads(content)
+                    except (ValueError, TypeError):
+                        result = {"success": False, "stderr": "Unreadable saved tool result"}
+                    had_outcome = await self.add_outcome(metadata.get("tool", ""), metadata.get("args", {}), result) or had_outcome
             elif metadata.get("tool_call"):
-                await transcript.mount(Collapsible(Static(json.dumps(metadata["tool_call"], indent=2), markup=False),
-                                                    title="Tool call", collapsed=True))
+                if self.details:
+                    await transcript.mount(Collapsible(Static(content, markup=False), title="Tool call · full model response", collapsed=True))
             elif metadata.get("internal") or metadata.get("accepted") is False:
-                await transcript.mount(Collapsible(Static(content, markup=False), title="Diagnostic · rejected/internal", collapsed=True))
+                if self.details:
+                    await transcript.mount(Collapsible(Static(content, markup=False), title=self.chrome("Diagnostic · rejected/internal"), collapsed=True))
             elif role == "assistant":
                 try:
                     decoded = json.loads(content)
                     text = decoded["say"] if isinstance(decoded, dict) and "say" in decoded else content
                 except (ValueError, TypeError):
                     text = content
-                await self.add_bubble("assistant", text)
+                if not self.details:
+                    text = concise_text(text)
+                    if self.redundant_final(text, had_outcome):
+                        text = ""
+                if text:
+                    await self.add_bubble("assistant", text)
             else:
+                had_outcome = False
                 await self.add_bubble("user", content)
         transcript.scroll_end(animate=False)
 
     async def append_delta(self, text: str) -> None:
         self._draft_text += text
+        if not self.details:
+            return
         if self._draft_widget is None:
-            self._draft_widget = Vertical(Static("Generating — unverified", classes="draft-label"),
+            self._draft_widget = Vertical(Static(self.chrome("Generating — unverified"), classes="draft-label"),
                                           Markdown("", id="draft-content"), id="draft", classes="bubble assistant")
             await self.chat_widget("#transcript", VerticalScroll).mount(self._draft_widget)
         await self._draft_widget.query_one(Markdown).update(self._draft_text)
@@ -309,18 +442,37 @@ class MedTechApp(App):
 
     async def finish_draft(self, text: str) -> None:
         await self.discard_draft()
-        await self.add_bubble("assistant", text)
+        if not self.details:
+            text = concise_text(text)
+            if self.redundant_final(text, self._turn_outcome):
+                return
+        if text:
+            await self.add_bubble("assistant", text)
 
     async def add_tool_call(self, tool: str, args: dict) -> None:
+        self._last_tool = (tool, args)
         await self.discard_draft()
-        await self.chat_widget("#transcript", VerticalScroll).mount(
-            Collapsible(Static(json.dumps(args, indent=2, ensure_ascii=False), markup=False),
-                        title="Tool call · " + tool, collapsed=True))
+        if self.details:
+            await self.chat_widget("#transcript", VerticalScroll).mount(
+                Collapsible(Static(json.dumps(args, indent=2, ensure_ascii=False), markup=False), title=self.chrome("Tool call · " + tool), collapsed=True))
 
     async def add_tool_result(self, ok: bool, text: str) -> None:
         await self.discard_draft()
-        await self.chat_widget("#transcript", VerticalScroll).mount(
-            Collapsible(Static(text, markup=False), title="Tool result · " + ("success" if ok else "failed"), collapsed=True))
+        if self.details:
+            await self.chat_widget("#transcript", VerticalScroll).mount(
+                Collapsible(Static(text, markup=False), title=self.chrome("Tool result · " + ("success" if ok else "failed")), collapsed=True))
+        else:
+            tool, args = self._last_tool
+            rows = self.store.messages(self.sid) if self.sid is not None else []
+            if rows and rows[-1]["role"] == "tool":
+                metadata = json.loads(rows[-1]["metadata"] or "{}")
+                tool, args = metadata.get("tool", tool), metadata.get("args", args)
+            try:
+                result = json.loads(text)
+            except (ValueError, TypeError):
+                result = {"success": ok, "stderr": text if not ok else "", "stdout": text if ok else ""}
+            self._turn_outcome = await self.add_outcome(tool, args, result) or self._turn_outcome
+        self.update_footer()
 
     @on(Input.Changed, "#chat-search")
     async def search_changed(self) -> None:
@@ -342,12 +494,13 @@ class MedTechApp(App):
         self.chat_widget("#send", Button).disabled = True
         try:
             if row["mode"] == "sandbox":
-                backend = SandboxBackend(workspace=row["workspace"])
+                backend = SandboxBackend(workspace=row["workspace"], extra_mounts=self.cfg.sandbox.extra_mounts)
                 self.set_status("Starting sandbox…")
                 # Docker setup does not access SQLite and may block on image startup.
                 await asyncio.to_thread(backend.ensure)
             else:
-                backend = LocalBackend(row["workspace"])
+                backend = LocalBackend(self.cfg.permissions.root or row["workspace"], permissions_mode=self.cfg.permissions.mode,
+                                       confirm_dangerous=self.cfg.permissions.confirm_dangerous)
             self.backend, self.sid = backend, sid
             self.update_footer()
             await self.refresh_history()
@@ -357,6 +510,7 @@ class MedTechApp(App):
             self.set_status(str(exc))
         finally:
             self.busy = False
+            self.chat_widget("#thinking", LoadingIndicator).display = False
             self.chat_widget("#send", Button).disabled = False
 
     async def action_new_chat(self) -> None:
@@ -478,6 +632,8 @@ class MedTechApp(App):
             self.sid = self.store.new_session(self.backend.name, getattr(self.backend, "host_root", self.backend.root))
         self.cancel_event.clear()
         self._turn_error = None
+        self._turn_traceback = ""
+        self._turn_outcome = False
         self.busy = True
         self.chat_widget("#send", Button).disabled = True
         self.chat_widget("#message-input", TextArea).clear()
@@ -496,15 +652,16 @@ class MedTechApp(App):
             agent.turn(text)
         except (Exception, InterruptedError) as exc:
             if not self._ui_closing:
-                self.call_from_thread(self.turn_failed, str(exc))
+                self.call_from_thread(self.turn_failed, str(exc), traceback.format_exc())
         finally:
             if worker_store is not None:
                 worker_store.close()
             if not self._ui_closing:
                 self.call_from_thread(self.turn_finished)
 
-    def turn_failed(self, text: str) -> None:
+    def turn_failed(self, text: str, trace: str = "") -> None:
         self._turn_error = text
+        self._turn_traceback = trace
 
     async def turn_finished(self) -> None:
         await self.discard_draft()
@@ -513,11 +670,13 @@ class MedTechApp(App):
         await self.render_transcript()
         self.chat_widget("#send", Button).disabled = False
         if self._turn_error:
-            await self.show_notice(self._turn_error)
+            await self.show_error(self._turn_error, self._turn_traceback)
         else:
             self.set_status("Ready" + (" · Updating memory…" if self._memory_active else ""))
         self.chat_widget("#message-input", TextArea).focus()
         self.busy = False
+        self.chat_widget("#thinking", LoadingIndicator).display = False
+        self.update_footer()
 
     def start_memory(self, text: str) -> None:
         if not self._ui_closing:
@@ -594,7 +753,34 @@ class MedTechApp(App):
             parts = shlex.split(line)
             command, args = parts[0].lower(), parts[1:]
             arg = " ".join(args)
-            if command in ("/exit", "/quit"):
+            if command == "/details" and arg in ("", "on", "off"):
+                await self.set_details(not self.details if not arg else arg == "on")
+            elif command == "/theme":
+                if arg:
+                    self.cfg.ui.theme = apply_theme(self, arg)
+                    self.save_preferences()
+                    self.set_status("Theme saved: " + self.cfg.ui.theme)
+                else:
+                    self.action_theme()
+            elif command == "/permissions":
+                if not self.available():
+                    return
+                if arg in ("full", "workspace"):
+                    self.cfg.permissions.mode = arg
+                    if self.backend.name == "local":
+                        self.backend.set_permissions(arg, root=self.cfg.permissions.root or self.backend.host_root)
+                    self.save_preferences()
+                elif len(args) == 2 and args[0] == "confirm" and args[1] in ("on", "off"):
+                    self.cfg.permissions.confirm_dangerous = args[1] == "on"
+                    if self.backend.name == "local":
+                        self.backend.confirm_dangerous = self.cfg.permissions.confirm_dangerous
+                    self.save_preferences()
+                elif arg:
+                    raise ValueError("Use /permissions full|workspace or /permissions confirm on|off")
+                permission = self.cfg.permissions.mode if self.backend.name == "local" else "workspace (Docker)"
+                self.set_status(f"Permissions: {permission}; dangerous confirmation {'on' if self.cfg.permissions.confirm_dangerous else 'off'}")
+                self.update_footer()
+            elif command in ("/exit", "/quit"):
                 self.action_quit()
             elif command == "/new":
                 await self.action_new_chat()
@@ -645,7 +831,7 @@ class MedTechApp(App):
                 await self.show_notice("\n".join(f"{row['tool']}: {row['status']} {row['output']}" for row in rows) or "No recorded tasks")
             elif command in ("/help", "/menu"):
                 await self.show_notice("Ctrl+N new · Ctrl+B sidebar · Ctrl+F search · F2 rename · Ctrl+O chat actions · Ctrl+Enter send · Escape cancel · Ctrl+Q quit\n"
-                                       "/new /history /chats /sessions /resume ID /rename ID TITLE /delete ID /memory /remember FACT /forget ID-or-text /memory clear /tasks [ID|all] /auto on|off /debug on|off /exit")
+                                       "/new /history /chats /sessions /resume ID /rename ID TITLE /delete ID /memory /remember FACT /forget ID-or-text /memory clear /tasks [ID|all] /auto on|off /permissions full|workspace /details on|off /theme [NAME] /debug on|off /exit")
             else:
                 self.set_status("Unknown command or invalid arguments. Try /help.")
         except (ValueError, StoreError, OSError) as exc:

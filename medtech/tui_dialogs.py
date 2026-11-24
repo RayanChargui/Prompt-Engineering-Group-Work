@@ -5,7 +5,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, ListItem, ListView, Static
+from textual.widgets import Button, Input, Label, ListItem, ListView, Static, Select, Switch
 
 from .store import Store
 
@@ -13,13 +13,6 @@ from .store import Store
 class Dialog(ModalScreen):
     """Centered, keyboard-dismissable modal base."""
     BINDINGS = [("escape", "cancel", "Cancel")]
-    DEFAULT_CSS = """
-    Dialog { align: center middle; background: $background 65%; }
-    Dialog > Vertical { width: 64; max-width: 95%; height: auto; max-height: 85%; border: round $accent; padding: 1 2; background: $surface; }
-    Dialog Horizontal { height: auto; margin-top: 1; }
-    Dialog Button { margin-right: 1; }
-    Dialog Label { margin-bottom: 1; }
-    """
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -121,14 +114,6 @@ class MemoryItem(ListItem):
 
 class MemoryDialog(Dialog):
     """Browse and remove durable facts without leaving the current chat."""
-    DEFAULT_CSS = """
-    MemoryDialog > Vertical { width: 78; height: 75%; }
-    MemoryDialog ListView { height: 1fr; }
-    MemoryDialog ListItem { height: auto; padding: 1; }
-    MemoryDialog ListItem Horizontal { margin: 0; }
-    MemoryDialog ListItem Static { width: 1fr; }
-    MemoryDialog ListItem Button { min-width: 10; width: 10; }
-    """
     def __init__(self, store: Store, on_mutation: Optional[Callable[[], None]] = None):
         super().__init__()
         self.store = store
@@ -162,3 +147,28 @@ class MemoryDialog(Dialog):
             if self.on_mutation is not None:
                 self.on_mutation()
             await self.refresh_facts()
+
+
+class ThemeDialog(Dialog):
+    """Choose the palette and portable ASCII glyph mode."""
+    def __init__(self, names: list, current: str, ascii_mode: bool = False):
+        super().__init__()
+        self.names, self.current, self.ascii_mode = names, current, ascii_mode
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Appearance")
+            yield Select([(name.title(), name) for name in self.names], value=self.current,
+                         allow_blank=False, id="theme-select")
+            with Horizontal():
+                yield Label("ASCII symbols")
+                yield Switch(value=self.ascii_mode, id="ascii-switch")
+            with Horizontal():
+                yield Button("Save", variant="primary", id="theme-save")
+                yield Button("Cancel", id="cancel")
+
+    @on(Button.Pressed, "#theme-save")
+    def save(self) -> None:
+        value = self.query_one("#theme-select", Select).value
+        if isinstance(value, str):
+            self.dismiss((value, self.query_one("#ascii-switch", Switch).value))
