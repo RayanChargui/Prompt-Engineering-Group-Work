@@ -137,11 +137,13 @@ def _move(c, a):
         raise Denied("cannot move the workspace root")
     if not os.path.exists(src):
         raise Denied("source not found")
+    kind = "directory" if os.path.isdir(src) else "file"
     dst = _dest(c, src, a["dst"])
     shutil.move(src, dst)
     if os.path.lexists(src):
         raise OSError("move verification failed: source still exists")
     verify(c, dst)
+    c.verified.append({"path": src, "kind": kind, "exists": False})
     return f"verified move {src} -> {dst}", None
 
 
@@ -159,6 +161,7 @@ def _delete(c, a):
     p = resolve(c, a["path"])
     if p == c.root:
         raise Denied("cannot delete the workspace root")
+    kind = "directory" if os.path.isdir(p) else "file"
     if os.path.isdir(p) and not os.path.islink(p):
         (shutil.rmtree if a.get("recursive") else os.rmdir)(p)
     elif os.path.exists(p) or os.path.islink(p):
@@ -167,6 +170,7 @@ def _delete(c, a):
         raise Denied("not found")
     if os.path.lexists(p):
         raise OSError("delete verification failed: path still exists")
+    c.verified.append({"path": p, "kind": kind, "exists": False})
     return f"deleted {p}", None
 
 
