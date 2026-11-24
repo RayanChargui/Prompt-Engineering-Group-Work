@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import posixpath
 import subprocess
 import time
 from pathlib import Path
@@ -37,7 +38,9 @@ class _Base:
 
     def run(self, tool: str, args: dict) -> dict:
         """Execute a typed operation and retain its working directory."""
-        res = self._exec({"root": self.root, "cwd": self.cwd, "tool": tool, "args": args})
+        res = self._exec({"root": self.root, "cwd": self.cwd, "tool": tool, "args": args,
+                          "permissions_mode": self.permissions_mode,
+                          "allowed_roots": self.allowed_roots, "read_only_roots": self.read_only_roots})
         if res["success"]:
             self.cwd = res["cwd"]
         return res
@@ -46,11 +49,26 @@ class _Base:
 class LocalBackend(_Base):
     name = "local"
 
-    def __init__(self, workspace: str):
-        self.root = os.path.realpath(os.path.expanduser(workspace))
-        self.host_root = self.root
-        os.makedirs(self.root, exist_ok=True)
+    def __init__(self, workspace: str, permissions_mode: str = "full", confirm_dangerous: bool = True):
+        self.confirm_dangerous = confirm_dangerous
+        self.set_permissions(permissions_mode, root=workspace)
         super().__init__()
+
+    def set_permissions(self, mode: str, root: str = None) -> None:
+        """Switch between native host access and an explicitly restricted workspace."""
+        if mode not in {"full", "workspace"}:
+            raise ValueError("permissions mode must be full or workspace")
+        previous_root = getattr(self, "root", None)
+        if root is not None:
+            self.root = os.path.realpath(os.path.expanduser(root))
+            self.host_root = self.root
+            os.makedirs(self.root, exist_ok=True)
+        self.permissions_mode = mode
+        self.allowed_roots, self.read_only_roots = [self.root], []
+        if root is not None and previous_root != self.root:
+            self.cwd = self.root
+        elif mode == "workspace" and not ops._inside(getattr(self, "cwd", self.root), self.root):
+            self.cwd = self.root
 
     def _exec(self, req: dict) -> dict:
         return ops.run(req)
@@ -64,12 +82,43 @@ class SandboxBackend(_Base):
     """
     name, root = "sandbox", "/workspace"
 
-    def __init__(self, workspace: str = None, name: str = None):
+    def __init__(self, workspace: str = None, name: str = None, extra_mounts: list = None):
         self.host_root = os.path.realpath(os.path.expanduser(workspace or SHARED))
-        self.box = name or BOX + "-" + hashlib.sha256(self.host_root.encode()).hexdigest()[:12]
+        self.extra_mounts = self._validate_mounts(extra_mounts if extra_mounts is not None else [])
+        identity = self.host_root + (json.dumps(self.extra_mounts, sort_keys=True) if self.extra_mounts else "")
+        self.box = name or BOX + "-" + hashlib.sha256(identity.encode()).hexdigest()[:12]
+        self.permissions_mode, self.confirm_dangerous = "workspace", True
+        self.allowed_roots = [self.root] + [mount["target"] for mount in self.extra_mounts]
+        self.read_only_roots = [mount["target"] for mount in self.extra_mounts if mount["read_only"]]
         self.user = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "1000:1000"
         super().__init__()
         self.src = Path(ops.__file__).read_text(encoding="utf-8")
+
+    @staticmethod
+    def _validate_mounts(mounts: list) -> list:
+        """Accept only explicit existing host directories with distinct container roots."""
+        if not isinstance(mounts, list):
+            raise ValueError("sandbox extra_mounts must be a list")
+        normalized, targets = [], ["/workspace"]
+        for mount in mounts:
+            if (not isinstance(mount, dict) or set(mount) - {"source", "target", "read_only"}
+                    or not isinstance(mount.get("source"), str) or not mount["source"].strip()
+                    or not isinstance(mount.get("target"), str)
+                    or type(mount.get("read_only", False)) is not bool):
+                raise ValueError("each sandbox mount requires source, target, and optional read_only boolean")
+            source = os.path.realpath(os.path.expanduser(mount["source"]))
+            target = mount["target"]
+            if (not target.startswith("/") or target.startswith("//") or target == "/" or "\x00" in target
+                    or target != posixpath.normpath(target) or ":" in target or "\\" in target
+                    or target == "/tmp" or target.startswith("/tmp/")):
+                raise ValueError("mount target must be an absolute normalized container directory outside /tmp")
+            if not os.path.isdir(source):
+                raise ValueError(f"sandbox mount source is not an existing directory: {source}")
+            if any(target == old or target.startswith(old + "/") or old.startswith(target + "/") for old in targets):
+                raise ValueError(f"sandbox mount target overlaps another mount: {target}")
+            targets.append(target)
+            normalized.append({"source": source, "target": target, "read_only": mount.get("read_only", False)})
+        return sorted(normalized, key=lambda mount: mount["target"])
 
     def _docker(self, *args: str) -> subprocess.CompletedProcess:
         try:
@@ -82,9 +131,12 @@ class SandboxBackend(_Base):
     def _matches(self, info: dict) -> bool:
         """Do not silently reuse a stale container pointing at another directory."""
         config, host = info.get("Config", {}), info.get("HostConfig", {})
-        mounts = [m for m in info.get("Mounts", []) if m.get("Destination") == self.root]
-        return (len(mounts) == 1 and mounts[0].get("Type") == "bind"
-                and mounts[0].get("Source") == self.host_root and mounts[0].get("RW") is True
+        mounts = {m.get("Destination"): (m.get("Source"), m.get("RW"))
+                  for m in info.get("Mounts", []) if m.get("Type") == "bind"}
+        expected = {self.root: (self.host_root, True)}
+        expected.update({mount["target"]: (mount["source"], not mount["read_only"]) for mount in self.extra_mounts})
+        foreign = [m for m in info.get("Mounts", []) if m.get("Type") not in {"bind", "tmpfs"}]
+        return (mounts == expected and not foreign
                 and config.get("WorkingDir") == self.root and config.get("Image") == IMAGE
                 and config.get("User") == self.user and host.get("NetworkMode") == "none"
                 and host.get("ReadonlyRootfs") is True and "ALL" in host.get("CapDrop", [])
@@ -112,11 +164,14 @@ class SandboxBackend(_Base):
         else:
             # A missing container is normal. Daemon/auth/image failures remain visible
             # in docker run's status and diagnostics, rather than being swallowed.
-            result = self._docker("run", "-d", "--name", self.box, "--network", "none", "--cap-drop", "ALL",
-                                  "--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp",
-                                  "--memory", "512m", "--cpus", "1", "--pids-limit", "128", "--user", self.user,
-                                  "-v", f"{self.host_root}:/workspace", "-w", "/workspace",
-                                  IMAGE, "sleep", "infinity")
+            arguments = ["run", "-d", "--name", self.box, "--network", "none", "--cap-drop", "ALL",
+                         "--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp",
+                         "--memory", "512m", "--cpus", "1", "--pids-limit", "128", "--user", self.user,
+                         "-v", f"{self.host_root}:/workspace", "-w", "/workspace"]
+            for mount in self.extra_mounts:
+                mode = "ro" if mount["read_only"] else "rw"
+                arguments += ["-v", f"{mount['source']}:{mount['target']}:{mode}"]
+            result = self._docker(*arguments, IMAGE, "sleep", "infinity")
             if result.returncode:
                 raise BackendError(f"Could not create sandbox: {result.stderr.strip()}")
         ready = self.run("pwd", {})

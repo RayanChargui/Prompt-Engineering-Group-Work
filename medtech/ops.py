@@ -1,7 +1,7 @@
-"""MedTech operations: jailed file + system tools. Stdlib only.
+"""MedTech operations: host filesystem or explicitly mapped workspace tools. Stdlib only.
 
 Runs in-process (local mode) or is piped into the Docker sandbox (sandbox mode),
-so both modes share exactly the same code and the same jail rules.
+Both execution modes share the same operations and structured verification results.
 """
 import datetime
 import fnmatch
@@ -10,6 +10,7 @@ import hashlib
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import time
 
@@ -23,37 +24,45 @@ class Denied(Exception):
 
 
 class Ctx:
-    def __init__(self, root, cwd):
+    def __init__(self, root, cwd, permissions_mode="workspace", allowed_roots=None, read_only_roots=None):
         self.root, self.cwd = root, cwd
+        self.permissions_mode = permissions_mode
+        self.allowed_roots = allowed_roots or [root]
+        self.read_only_roots = read_only_roots or []
         self.verified = []
         self.stderr = ""
         self.exit_code = 0
 
 
-def resolve(c, path):
-    """Resolve a user/LLM-supplied path and make sure it stays inside the workspace."""
+def _inside(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:
+        return False
+
+
+def resolve(c: Ctx, path: str, write: bool = False) -> str:
+    """Resolve native host paths in full mode, or enforce explicit allowed roots."""
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         raise Denied("invalid path")
     path = path.strip()
-    if path.startswith("~"):
+    if c.permissions_mode == "full":
+        path = os.path.expanduser(path)
+    elif path.startswith("~"):
         raise Denied("'~' is not allowed; use paths inside the workspace")
     p = path if os.path.isabs(path) else os.path.join(c.cwd, path)
-    p = os.path.realpath(p)  # resolves symlinks and '..'
-    try:
-        inside = os.path.commonpath([c.root, p]) == c.root
-    except ValueError:  # different drives on Windows
-        inside = False
-    if not inside:
-        raise Denied(f"outside the workspace: {path}")
-    parts = {x.lower() for x in rel(c, p).replace("\\", "/").split("/")}
+    p = os.path.realpath(p)
+    if c.permissions_mode == "full":
+        return p
+    roots = [root for root in c.allowed_roots if _inside(p, root)]
+    if not roots:
+        raise Denied(f"outside the workspace and configured mounts: {path}")
+    if write and any(_inside(p, root) for root in c.read_only_roots):
+        raise Denied(f"read-only mounted path: {p}")
+    parts = {x.lower() for x in os.path.relpath(p, max(roots, key=len)).replace("\\", "/").split("/")}
     if parts & BLOCKED_DIRS or os.path.basename(p).lower() in BLOCKED_FILES:
         raise Denied(f"protected file or folder: {path}")
     return p
-
-
-def rel(c, p):
-    r = os.path.relpath(p, c.root)
-    return "." if r == "." else r.replace(os.sep, "/")
 
 
 def _pwd(c, a):
@@ -62,25 +71,26 @@ def _pwd(c, a):
 
 def _cd(c, a):
     p = resolve(c, a["path"])
-    if not os.path.isdir(p):
+    if not stat.S_ISDIR(os.stat(p).st_mode):
         raise Denied("not a directory")
     return f"now in {p}", p
 
 
 def _ls(c, a):
     p = resolve(c, a.get("path", "."))
-    if not os.path.isdir(p):
+    if not stat.S_ISDIR(os.stat(p).st_mode):
         raise Denied("not a directory")
     rows = []
     for n in sorted(os.listdir(p))[:MAX_LIST]:
         f = os.path.join(p, n)
-        rows.append(f"{n}/" if os.path.isdir(f) else f"{n}  ({os.path.getsize(f)} B)")
+        entry = os.stat(f)
+        rows.append(f"{n}/" if stat.S_ISDIR(entry.st_mode) else f"{n}  ({entry.st_size} B)")
     return "\n".join(rows) or "(empty)", None
 
 
 def _read(c, a):
     p = resolve(c, a["path"])
-    if not os.path.isfile(p):
+    if not stat.S_ISREG(os.stat(p).st_mode):
         raise Denied("not a file")
     with open(p, "rb") as f:
         data = f.read(MAX_READ + 1)
@@ -91,18 +101,19 @@ def _read(c, a):
 
 
 def _write(c, a):
-    p = resolve(c, a["path"])
+    p = resolve(c, a["path"], write=True)
     mode, content = a.get("mode", "create"), a["content"]
     if len(content) > MAX_WRITE:
         raise Denied("content too large")
-    if os.path.isdir(p):
+    existing = optional_stat(p)
+    if existing is not None and stat.S_ISDIR(existing.st_mode):
         raise Denied("path is a directory")
-    if mode == "create" and os.path.exists(p):
+    if mode == "create" and existing is not None:
         raise Denied("file exists (use mode 'overwrite' or 'append')")
     os.makedirs(os.path.dirname(p), exist_ok=True)
     if mode not in {"create", "overwrite", "append"}:
         raise Denied("invalid write mode")
-    before = os.path.getsize(p) if mode == "append" and os.path.exists(p) else 0
+    before = existing.st_size if mode == "append" and existing is not None else 0
     with open(p, {"create": "x", "append": "a", "overwrite": "w"}[mode], encoding="utf-8", newline="") as f:
         f.write(content)
     data = content.encode("utf-8")
@@ -115,32 +126,33 @@ def _write(c, a):
 
 
 def _mkdir(c, a):
-    p = resolve(c, a["path"])
+    p = resolve(c, a["path"], write=True)
     os.makedirs(p, exist_ok=True)
     verify(c, p)
     return f"verified directory {p}", None
 
 
 def _dest(c, src, dst_arg):
-    dst = resolve(c, dst_arg)
-    if os.path.isdir(dst):
-        dst = resolve(c, os.path.join(dst, os.path.basename(src)))
-    if os.path.exists(dst):
-        raise Denied(f"destination exists: {rel(c, dst)}")
+    dst = resolve(c, dst_arg, write=True)
+    destination = optional_stat(dst)
+    if destination is not None and stat.S_ISDIR(destination.st_mode):
+        dst = resolve(c, os.path.join(dst, os.path.basename(src)), write=True)
+        destination = optional_stat(dst)
+    if destination is not None:
+        raise Denied(f"destination exists: {dst}")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     return dst
 
 
 def _move(c, a):
-    src = resolve(c, a["src"])
-    if src == c.root:
+    src = resolve(c, a["src"], write=True)
+    if c.permissions_mode != "full" and src in c.allowed_roots:
         raise Denied("cannot move the workspace root")
-    if not os.path.exists(src):
-        raise Denied("source not found")
-    kind = "directory" if os.path.isdir(src) else "file"
+    source = os.stat(src)
+    kind = "directory" if stat.S_ISDIR(source.st_mode) else "file"
     dst = _dest(c, src, a["dst"])
     shutil.move(src, dst)
-    if os.path.lexists(src):
+    if optional_stat(src, follow_symlinks=False) is not None:
         raise OSError("move verification failed: source still exists")
     verify(c, dst)
     c.verified.append({"path": src, "kind": kind, "exists": False})
@@ -149,26 +161,29 @@ def _move(c, a):
 
 def _copy(c, a):
     src = resolve(c, a["src"])
-    if not os.path.exists(src):
-        raise Denied("source not found")
+    source = os.stat(src)
     dst = _dest(c, src, a["dst"])
-    (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dst)
+    if stat.S_ISDIR(source.st_mode):
+        # Restricted copies preserve links without following them outside allowed
+        # roots. Any subsequent tool access still goes through resolve().
+        shutil.copytree(src, dst, symlinks=c.permissions_mode != "full")
+    else:
+        shutil.copy2(src, dst)
     verify(c, dst)
     return f"verified copy {src} -> {dst}", None
 
 
 def _delete(c, a):
-    p = resolve(c, a["path"])
-    if p == c.root:
+    p = resolve(c, a["path"], write=True)
+    if c.permissions_mode != "full" and p in c.allowed_roots:
         raise Denied("cannot delete the workspace root")
-    kind = "directory" if os.path.isdir(p) else "file"
-    if os.path.isdir(p) and not os.path.islink(p):
+    existing = os.lstat(p)
+    kind = "directory" if stat.S_ISDIR(existing.st_mode) else "file"
+    if stat.S_ISDIR(existing.st_mode):
         (shutil.rmtree if a.get("recursive") else os.rmdir)(p)
-    elif os.path.exists(p) or os.path.islink(p):
-        os.remove(p)
     else:
-        raise Denied("not found")
-    if os.path.lexists(p):
+        os.remove(p)
+    if optional_stat(p, follow_symlinks=False) is not None:
         raise OSError("delete verification failed: path still exists")
     c.verified.append({"path": p, "kind": kind, "exists": False})
     return f"deleted {p}", None
@@ -177,11 +192,16 @@ def _delete(c, a):
 def _search(c, a):
     q, kind = a["query"].lower(), a.get("kind", "name")
     base, hits = resolve(c, a.get("path", ".")), []
-    for d, dirs, files in os.walk(base):
-        dirs[:] = [x for x in dirs if x not in BLOCKED_DIRS]
+    if not stat.S_ISDIR(os.stat(base).st_mode):
+        raise Denied("not a directory")
+    def walk_error(error):
+        raise error
+    for d, dirs, files in os.walk(base, onerror=walk_error):
+        if c.permissions_mode != "full":
+            dirs[:] = [x for x in dirs if x not in BLOCKED_DIRS]
         for f in files:
             fp = os.path.join(d, f)
-            if f in BLOCKED_FILES or os.path.islink(fp):
+            if c.permissions_mode != "full" and (f in BLOCKED_FILES or os.path.islink(fp)):
                 continue
             if kind == "name":
                 if q in f.lower() or fnmatch.fnmatch(f.lower(), q):
@@ -195,7 +215,7 @@ def _search(c, a):
                             if q in line.lower():
                                 hits.append(f"{fp}:{n}: {line.strip()[:120]}")
                                 break
-                except (UnicodeDecodeError, OSError):
+                except UnicodeDecodeError:
                     continue
             if len(hits) >= MAX_HITS:
                 return "\n".join(hits) + "\n...[more results]", None
@@ -220,7 +240,7 @@ def _sysinfo(c, a):
     if k == "whoami":
         return getpass.getuser(), None
     if k == "disk":
-        u = shutil.disk_usage(c.root)
+        u = shutil.disk_usage(c.cwd if c.permissions_mode == "full" else c.root)
         return f"total {u.total >> 30} GiB, free {u.free >> 30} GiB", None
     if k == "date":
         return datetime.datetime.now().isoformat(timespec="seconds"), None
@@ -232,12 +252,20 @@ TOOLS = {"pwd": _pwd, "cd": _cd, "ls": _ls, "read_file": _read, "write_file": _w
          "search": _search, "sysinfo": _sysinfo}
 
 
+def optional_stat(path: str, follow_symlinks: bool = True):
+    """Treat only missing paths as absent; access and traversal failures propagate."""
+    try:
+        return os.stat(path) if follow_symlinks else os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
 def verify(c: Ctx, path: str) -> None:
     """Record a stat/read-back result in the environment that performed the write."""
     st = os.stat(path)
-    record = {"path": path, "kind": "directory" if os.path.isdir(path) else "file",
+    record = {"path": path, "kind": "directory" if stat.S_ISDIR(st.st_mode) else "file",
               "exists": True, "size": st.st_size}
-    if os.path.isfile(path) and st.st_size <= MAX_WRITE:
+    if stat.S_ISREG(st.st_mode) and st.st_size <= MAX_WRITE:
         with open(path, "rb") as f:
             record["sha256"] = hashlib.sha256(f.read()).hexdigest()
     c.verified.append(record)
@@ -248,12 +276,12 @@ def run(req: dict) -> dict:
     started = time.monotonic()
     root = os.path.realpath(req["root"])
     cwd = os.path.realpath(req.get("cwd") or root)
-    try:
-        if os.path.commonpath([root, cwd]) != root:
-            cwd = root
-    except ValueError:
+    mode = req.get("permissions_mode", "workspace")
+    allowed_roots = [os.path.realpath(path) for path in req.get("allowed_roots", [root])]
+    read_only_roots = [os.path.realpath(path) for path in req.get("read_only_roots", [])]
+    if mode != "full" and not any(_inside(cwd, path) for path in allowed_roots):
         cwd = root
-    c = Ctx(root, cwd)
+    c = Ctx(root, cwd, mode, allowed_roots, read_only_roots)
     out, err, code = "", "", 0
     try:
         out, new = TOOLS[req["tool"]](c, req.get("args") or {})

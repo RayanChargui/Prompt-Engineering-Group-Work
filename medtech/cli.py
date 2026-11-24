@@ -27,6 +27,7 @@ HELP = f"""[bold {ACCENT}]/new[/] new chat    [bold {ACCENT}]/history[/] or [bol
 [bold {ACCENT}]/memory[/] list facts    [bold {ACCENT}]/remember <fact>[/] save fact
 [bold {ACCENT}]/forget <id or text>[/] remove fact    [bold {ACCENT}]/memory clear[/] remove all facts
 [bold {ACCENT}]/auto on|off[/] auto-approve safe writes (deletes and overwrites always ask)
+[bold {ACCENT}]/permissions full|workspace[/] local access scope
 [bold {ACCENT}]/debug on|off[/] log tool diagnostics to file
 [bold {ACCENT}]/tasks [id|all][/] executed actions    [bold {ACCENT}]/help[/] help    [bold {ACCENT}]exit[/] leave"""
 
@@ -186,7 +187,8 @@ class UI:
 def build_parser():
     p = argparse.ArgumentParser(prog="medtech", description="MedTech terminal agent")
     p.add_argument("--mode", choices=["sandbox", "local"], help="skip the question")
-    p.add_argument("--workspace", default="~/medtech-workspace", help="folder the agent may touch in local mode")
+    p.add_argument("--workspace", default="~/medtech-workspace", help="initial local directory; also the default root in workspace permission mode")
+    p.add_argument("--permissions", choices=["full", "workspace"], help="local filesystem scope (config default: full)")
     p.add_argument("--model", help="Ollama chat model (default qwen2.5:7b or MEDTECH_MODEL)")
     p.add_argument("--num-ctx", type=int, help="model context size, 8192..32768 (MEDTECH_NUM_CTX or 16384)")
     p.add_argument("--plain", action="store_true", help="use the line-oriented interface instead of the Textual UI")
@@ -210,7 +212,7 @@ def ask_mode():
     g.add_row(Text(" 1 ", style="bold #0b1d26 on #3fc1e8"),
               Text.from_markup(f"[bold {SOFT}]Sandbox[/]  [dim]isolated Docker container, no network, resource-limited[/]"))
     g.add_row(Text(" 2 ", style="bold #0b1d26 on #3fc1e8"),
-              Text.from_markup(f"[bold {SOFT}]Local[/]    [dim]your own computer, restricted to one workspace folder[/]"))
+              Text.from_markup(f"[bold {SOFT}]Local[/]    [dim]your own computer, using the configured filesystem permissions[/]"))
     c.print(Panel(g, box=box.ROUNDED, border_style=ACCENT, padding=(1, 3),
                   title=f"[bold {ACCENT}] Select environment [/]"))
     while True:
@@ -224,14 +226,17 @@ def ask_mode():
         c.print("[yellow]type sandbox, local or exit[/]")
 
 
-def make_backend(mode: str, workspace: str = None):
+def make_backend(mode: str, workspace: str = None, cfg=None):
     """Open the recorded workspace without changing the user's filesystem location."""
+    cfg = cfg or Config()
     if mode == "sandbox":
-        backend = SandboxBackend(workspace=workspace)
+        backend = SandboxBackend(workspace=workspace, extra_mounts=cfg.sandbox.extra_mounts)
         with c.status("starting sandbox ..."):
             backend.ensure()
         return backend
-    return LocalBackend(workspace or "~/medtech-workspace")
+    initial = (cfg.permissions.root if cfg.permissions.mode == "workspace" else None) or workspace or "~/medtech-workspace"
+    return LocalBackend(initial, permissions_mode=cfg.permissions.mode,
+                        confirm_dangerous=cfg.permissions.confirm_dangerous)
 
 
 def new_chat(agent: Agent, store: Store) -> None:
@@ -247,7 +252,7 @@ def resume_chat(agent: Agent, store: Store, sid: int) -> None:
     session = store.session(sid)
     if session is None:
         raise ValueError(f"no session {sid}")
-    backend = make_backend(session["mode"], session["workspace"])
+    backend = make_backend(session["mode"], session["workspace"], getattr(agent, "cfg", None))
     agent.backend = backend
     agent.resume(sid)
     c.print(f"[dim]Resumed chat {sid} in {escape(backend.where())}[/]")
@@ -307,6 +312,21 @@ def command(line: str, agent: Agent, store: Store) -> None:
             c.print(f"[dim]Forgot {count} fact(s)[/]")
         elif cmd == "/tasks":
             show_tasks(store, None if arg == "all" else int(arg) if arg else agent.sid)
+        elif cmd == "/permissions":
+            if agent.backend.name != "local":
+                c.print("Docker stays restricted to its configured bind mounts.")
+            else:
+                if arg in ("full", "workspace"):
+                    agent.cfg.permissions.mode = arg
+                    agent.backend.set_permissions(arg, agent.cfg.permissions.root)
+                    agent.cfg.save_preferences()
+                elif len(args) == 2 and args[0] == "confirm" and args[1] in ("on", "off"):
+                    agent.cfg.permissions.confirm_dangerous = args[1] == "on"
+                    agent.backend.confirm_dangerous = agent.cfg.permissions.confirm_dangerous
+                    agent.cfg.save_preferences()
+                elif arg:
+                    raise ValueError("Use /permissions full|workspace or /permissions confirm on|off")
+                c.print(f"Permissions: {agent.backend.permissions_mode}; cwd: {agent.backend.where()}")
         elif cmd == "/debug" and arg in ("", "on", "off"):
             if arg:
                 agent.debug = arg == "on"
@@ -339,6 +359,8 @@ def _main(argv=None):
         if c.is_terminal and not use_tui:
             draw_logo()
         cfg = Config()
+        if a.permissions:
+            cfg.permissions.mode = a.permissions
         if a.model:
             cfg.model = a.model
         if a.num_ctx is not None:
@@ -353,7 +375,7 @@ def _main(argv=None):
         if mode is None:
             return c.print("[dim]Goodbye.[/]")
         workspace = resumed["workspace"] if resumed else a.workspace if mode == "local" else None
-        backend = make_backend(mode, workspace)
+        backend = make_backend(mode, workspace, cfg)
         if use_tui:
             from .tui import MedTechApp
             return MedTechApp(cfg, backend, store, sid=resumed["id"] if resumed else None,

@@ -17,7 +17,7 @@ def tool_definitions() -> list:
                 spec["enum"] = sorted(policy.ENUMS[(name, key)])
             properties[key] = spec
         tools.append({"type": "function", "function": {
-            "name": name, "description": f"Execute the jailed {name} operation in the active workspace.",
+            "name": name, "description": f"Execute the {name} operation under the active filesystem permission mode.",
             "parameters": {"type": "object", "properties": properties,
                            "required": [key for key, (_, required) in schema.items() if required],
                            "additionalProperties": False}}})
