@@ -95,7 +95,7 @@ def real_creation(backend: object, db: Path) -> None:
         agent = Agent(Config(), backend, store, sid, ui, auto=True)
         agent.turn("Create folder test_dir with hello.txt inside it, containing exactly the two characters hi. "
                    "Use the filesystem tools, then report the verified absolute file path.")
-        result = backend.run("read_file", {"path": "test_dir/hello.txt"})
+        result = backend.run("read_file", {"path": backend.root + "/test_dir/hello.txt"})
         require(result["success"] and result["stdout"] == "hi", f"Environment read-back failed: {result}")
         host_file = Path(backend.host_root) / "test_dir" / "hello.txt"
         require(host_file.read_text(encoding="utf-8") == "hi", f"Host file missing or incorrect: {host_file}")
